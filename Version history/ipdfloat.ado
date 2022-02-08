@@ -23,7 +23,8 @@
 
 * v0.1  David Fisher 17sep2021
 * v0.2  David Fisher 28sep2021 
-*! v0.3  David Fisher 17dec2021
+* v0.3  David Fisher 17dec2021
+*! v0.3.1  David Fisher 05jan2022 -- intermediate test version with some options/routines removed
 
 * Note DF 17th Dec 2021: needs to use -ipdmetan- version 4.03  David Fisher  29nov2021
 * (as yet unreleased)
@@ -64,7 +65,8 @@ program define ipdfloat, eclass
 	local command `"`s(after)'"'
 	
 	syntax, STUDY(varname) ///
-		[SHOWmodels HARD SEPGroups EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR]
+		[ TRTVAR(varname) INTVARs(varlist) ///
+		  SHOWmodels HARD SEPGroups EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR ]
 
 	`version' _prefix_command ipdfloat, level(`level') : `command'
 	local cmdname `"`s(cmdname)'"'
@@ -317,45 +319,19 @@ program define ipdfloat, eclass
 			local ++k_check
 		}
 		assert `k_check'==`k'
-
-		local sigmagamma fixed		// TEMP ONLY
 		
-		/* FOLLOWING SECTION OF CODE IS IDENTICAL TO -metafloat */
 		nois disp as text _n "Test of interaction(s):"
-		`quietly' mvmeta y S, vars(`vlist') print(`print') `sigmagamma' `soptions' `eformopt'
+		`quietly' mvmeta y S, vars(`vlist') fixed
 		nois test `vlist'
 		local chi2_int = r(chi2)
 		local df_int = r(df)
 		local p_int = r(p)
 
 		local k1 = `k' - 1
-		tempname VarGammaHat GammaHat SigmaGamma Chol
+		tempname GammaHat VarGammaHat		
 		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
 		matrix define `GammaHat'    = e(b)[1,       1..`k1']
-		matrix define `SigmaGamma'  = e(Sigma)
-		
-		// extract cholesky matrix of Sigma
-		if `"`structure'"'=="unstructured" {
-			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
-			// so don't bother packing them up into a matrix; we're only going to unpack them again later		
-			matrix define `Chol' = e(b)[1, `k'...]
-		}
-		else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
-			local tau = e(b)[1, `k']
-			cholesky2 `SigmaGamma' `Chol'
-			matrix define `Chol' = sign(`tau') * `Chol'
-		}
-		else if `"`structure'"'=="randombeta" {
-			matrix define `Chol' = J(`k1', `k1', 0)
-		}
-		
-		local rownames_eb : rownames e(b)
-		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''
-		matrix coleq `GammaHat' = :
-		matrix coleq `VarGammaHat' = :
-		matrix roweq `VarGammaHat' = :		
-		/* END SECTION OF CODE */
-		
+
 		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 			
 			tokenize intvars
@@ -468,34 +444,21 @@ program define ipdfloat, eclass
 		restore
 		*/
 	}
-
-	local sigmabeta fixed		// TEMP ONLY
 	
 	preserve
-		if "`showmodels'"!="" nois disp as text _n `"Estimation of floating subgroup for reference category:"'
-		qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-		`quietly' mvmeta y S, print(`print') commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
-		// mvmeta y S, fixed commonparm
+		qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`trtvar') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+		mvmeta y S, fixed commonparm
 
 		tempname ThetaHat VarThetaHat
 		matrix define `VarThetaHat' = e(V)[1,1]
 		matrix define `ThetaHat'    = e(b)[1,1]
-		
-		// extract fitted BS variance and derive SigmaBeta
-		if `"`sepgroups'"'!=`""' {
-			tempname SigmaU L SigmaBeta
-			matrix define `SigmaU' = e(Sigma)
-			matrix define `L' = J(`k', `k1', 0), J(`k', 1, 1)
-			matrix define `L'[2, 1] = I(`k1')
-			matrix define `SigmaBeta' = `L'*`SigmaU'*`L''
-		}
 		
 		if "`saving'"!="" | "`clear'"!="" {
 			keep Trial _y* _S*
 			qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)					
 			tempfile subgroups
 			qui save `subgroups'
-		}	
+		}		
 	restore
 	
 
@@ -525,12 +488,14 @@ program define ipdfloat, eclass
 			qui ipdmetan, study(`study') poolvar(`trtvar') nograph norsample : `command_new' if `touse', `offset_opts' `cmdopts'
 			scalar `eff_pos' = r(eff)
 		}
+		else {
 		*/
-		preserve
-			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-			qui mvmeta y S, fixed commonparm
-			scalar `eff_pos' = e(b)[1,1]
-		restore
+			preserve
+				qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+				qui mvmeta y S, fixed commonparm
+				scalar `eff_pos' = e(b)[1,1]
+			restore
+		// }
 		
 		if `"`forwards'`backwards'"'!=`""' {
 			matrix `Grad'[1, `i'] = `sign'(`eff_pos' - `ThetaHat'[1,1])/`h'
@@ -549,12 +514,14 @@ program define ipdfloat, eclass
 			qui ipdmetan, study(`study') poolvar(`trtvar') nograph norsample : `command_new' if `touse', `offset_opts' `cmdopts'
 			scalar `eff_neg' = r(eff)
 		}
+		else {
 		*/
-		preserve
-			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-			qui mvmeta y S, fixed commonparm
-			scalar `eff_neg' = e(b)[1,1]
-		restore
+			preserve
+				qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+				qui mvmeta y S, fixed commonparm
+				scalar `eff_neg' = e(b)[1,1]
+			restore
+		// }
 
 		matrix `Grad'[1, `i'] = (`eff_pos' - `eff_neg')/(2*`h')
 	}
