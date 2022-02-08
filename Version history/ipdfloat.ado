@@ -23,93 +23,226 @@
 
 * v0.1  David Fisher 17sep2021
 * v0.2  David Fisher 28sep2021 
+*! v0.3  David Fisher 17dec2021
 
+* Note DF 17th Dec 2021: needs to use -ipdmetan- version 4.03  David Fisher  29nov2021
+* (as yet unreleased)
 
 program define ipdfloat, eclass
 	
 	version 11.0
 	local version : di "version " string(_caller()) ":"	
 	
+	// Check that -metan- v4.05+ and -ipdmetan- v4.03+ are installed
+	cap metan
+	if `"`r(metan_version)'"'==`""' {
+		nois disp as err `"{bf:ipdfloat} requires version 4.05 or higher of {bf:metan}"'
+		exit 499
+	}
+	else {
+		local reqd_version = 4.05
+		if `r(metan_version)' < `reqd_version' {
+			nois disp as err `"{bf:ipdfloat} requires version 4.05 or higher of {bf:metan}"'
+			exit 499
+		}
+	}
+	cap ipdmetan
+	if `"`r(ipdmetan_version)'"'==`""' {
+		nois disp as err `"{bf:ipdfloat} requires version 4.03 or higher of {bf:ipdmetan}"'
+		exit 499
+	}
+	else {
+		local reqd_version = 4.03
+		if `r(ipdmetan_version)' < `reqd_version' {
+			nois disp as err `"{bf:ipdfloat} requires version 4.03 or higher of {bf:ipdmetan}"'
+			exit 499
+		}
+	}
+	
 	_on_colon_parse `0'
 	local 0       `"`s(before)'"'
 	local command `"`s(after)'"'
 	
-	syntax, STUDY(varname) POOLvars(varlist numeric min=2 max=2) ///
-		[FACTOR SEPGroups REFerence(string) EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR]
+	syntax, STUDY(varname) ///
+		[SHOWmodels HARD SEPGroups EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR]
 
-	`version' _prefix_command ipdfloat2, level(`level') : `command'
+	`version' _prefix_command ipdfloat, level(`level') : `command'
+	local cmdname `"`s(cmdname)'"'
+	local cmdopts `"`s(options)'"'
+	local rest `"`s(anything)'"'	
+	
 	tempvar touse
 	mark `touse' `s(if)' `s(in)'
-	markout `touse' `study' `poolvars'
+	markout `touse' `study', strok
 	
-	cap drop _Trt*
-	cap drop _Fac*
 	
-	gettoken trtvar intvar : poolvars
-	qui tab `trtvar'
-	if `r(r)'!=2 {
-		nois disp as err "Treatment variable must have exactly two values"
+	*** Find treatment and interaction effect(s)  ( = contrasts if `factor')
+	// Assume first element of `command' is of the form: i.`trtvar'*`i'`intvar'
+	if substr(`"`cmdname'"', 1, 2)!="st" {		// survival commands don't have a dependent variable
+		gettoken depvar rest : rest
+		// local depvar : copy local cmdname
+		// gettoken cmdname : rest
+	}
+	
+	tokenize `"`rest'"', parse(" .*")
+	local abbtrtvar : copy local 3
+	unab fulltrtvar : `3'
+	capture {
+		assert `"`1'`2'"'==`"i."'
+		assert `"`4'"'==`"*"'
+	}
+	if _rc {
+		nois disp as err  "Could not identify treatment and subgroup variables"
+		nois disp as err `"First element of {it:command} should be of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
 		exit 198
 	}
-	summ `trtvar', meanonly
-	qui gen byte _Trt = (`trtvar'==r(max))
 	
-	local k1 = 1
-	if "`factor'"!="" {
-		cap tab `intvar'
-		if _rc | `r(r)'>10 {
-			nois disp as err `"Too many factor levels in variable {bf:`intvar'}"'
+	if `"`5'`6'"'==`"i."' {
+		local factor factor
+		unab unab7 : `7'
+		fvunab other : `8'
+		
+		if `"`8'"'==`"*"' {
+			nois disp as err `"{bf:ipdfloat} currently only supports two-way treatment-covariate interaction terms"'
 			exit 198
 		}
+	}
+	else {
+		// if continuous, `5' should contain the (first) covariate interaction variable
+		unab unab7 : `5'
+	
+		// also need to search for any other terms beginning "i.trt*[covariate]"
+		// as these will not be included in `VarsToDrop' but will be needed to form `intvars'
+		local abbtrtlen = length(`"`abbtrtvar'"')
+		gettoken el newrest : rest
+		local k = 1						// for treatment
+		while `"`el'"'!=`""' {
+			tokenize `"`el'"', parse(".*")
+			if `"`1'`2'"'==`"i."' & `"`4'"'==`"*"' {
+				local len3 = length(`"`3'"')
+				if substr(`"`3'"', 1, min(`len3', `abbtrtlen'))==substr(`"`abbtrtvar'"', 1, min(`len3', `abbtrtlen')) {
+					unab foo : `5'
+					local covars `covars' `foo'
+					local ++k
+				}
+			}
+			else local other `other' `el'
+			gettoken el newrest : newrest
+		}		
+		fvunab other : `other'
+	}
+	
+	qui xi, prefix(_J) `rest'
+	local OldVarsPrefix : char _dta[__xi__Vars__Prefix__]
+	local OldVarsToDrop: char _dta[__xi__Vars__To__Drop__]
+	local i = 0
+	foreach el of local OldVarsPrefix {
+		local ++i
+		if `"`el'"'==`"_J"' {
+			local eli : word `i' of `OldVarsToDrop'
+			local VarsToDrop `VarsToDrop' `eli'
+		}
+	}
+	
+	// Process treatment variable
+	gettoken trtvar rest : VarsToDrop			// first element should be of the form _J[trtvar]_1
+	local trtlen = length(`"`trtvar'"')
+	local trtvar7 = substr(`"`trtvar'"', 3, min(7, `=`trtlen'-4'))	// isolates [trtvar] truncated to 7 characters (so that _J[trtvar]_1 is 11 characters max)
+	
+	cap	assert `"`trtvar7'"'==substr(`"`fulltrtvar'"', 1, `trtlen')
+	if _rc {
+		nois disp as err "Error in isolating treatment variable"
+		exit _rc
+	}	
+	cap tab `trtvar7' if `touse'									// this will also trap varname ambiguities
+	if _rc==111 {
+		nois disp as err "Treatment variable {bf:`trtvar7'} must be uniquely identifiable by its first 7 characters"
+	}
+	if _rc exit _rc
+	cap assert `r(r)'==2
+	if _rc {
+		nois disp as err "Treatment variable {bf:`trtvar7'} must take exactly two values"
+		exit _rc
+	}	
+	
+	local _Jtrt = "_J" + substr(`"`trtvar7'"', 1, 3)	// isolates the string "_J[trt]" where [trt] = [trtvar] truncated to 3 characters
+	tokenize `VarsToDrop'
+	while `"`1'"'!=`""' {
+		if substr(`"`1'"', 1, 5)==`"`_Jtrt'"' {
+			local usevars `usevars' `1'			// `usevars' is a subset of `VarsToDrop', beginning "_J[trt]X..."  (or _J[trtvar] itself)
+		}
+		else {									// `facvars' contain the remainder...
+			local facvars `facvars' `1'			// ...should be the main-effects of the factor-variable covariate (if applicable)
+		}
+		macro shift
+	}
+	if `"`usevars'"'==`""' {
+		nois disp as err  "Could not identify treatment and subgroup variables"
+		nois disp as err `"First element of {it:command} should be of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
+		exit 198
+	}
+	
+
+	// Process interaction variable
+	gettoken intvar : rest
+	cap assert `"`intvar'"'!=`""'
+	if _rc {
+		nois disp as err "Subgroup variable could not be identified"
+		exit 198
+	}
+
+	// if factor, second element should be of the form _J[intvar]_1
+	// else if continuous, "xi:" will not create a new variable for `intvar', so...
+	//    ...second element will be the interaction itself, of the form _J[trtvar3]X[intvar]
+	local intlen = length(`"`intvar'"')
+	local _Jtrtlen = length(`"`_Jtrt'"')
+	local intvar7 = substr(`"`intvar'"', 3, min(7, `=`intlen'-4'))	// isolates [intvar] truncated to 7 characters (so that _J[intvar]_1 is 11 characters max)
+	cap assert (`"`factor'"'==`""') == (substr(`"`intvar'"', 1, min(5, `_Jtrtlen'))==`"`_Jtrt'"')
+	if _rc {
+		nois disp as err "Subgroup variable could not be identified"
+		exit 198
+	}
+	
+	if `"`factor'"'!=`""' {
+		cap tab `intvar7' if `touse'	// this will trap varname ambiguities
 		local k = r(r)
 		local k1 = `k' - 1
-		
-		if `"`reference'"'==`""' {
+		if _rc==111 {
+			nois disp as err "Subgroup variable {bf:`intvar7'} must be uniquely identifiable by its first 7 characters"
+		}
+		else if `k'>10 {
+			nois disp as err `"Too many factor levels in variable {bf:`intvar7'} (max of 10)"'
+			exit 198
+		}
+		if _rc exit _rc
+				
+		// find reference value
+		unab intvar : `intvar7'
+		local ref : char `intvar'[omit]
+		if `"`ref'"'==`""' {
 			summ `intvar', meanonly
 			local ref = r(min)
 		}
 		else {
-			cap confirm integer number `reference'
-			if _rc {
-				nois disp as err `"With {bf:factor} option, {bf:reference(#)} must be a single integer value"'
-				exit 198
+			confirm integer number `ref'
+			qui count if `intvar'==`ref'
+			if `r(N)' {
+				summ `intvar', meanonly
+				nois disp `"{error}Reference value `ref' is not taken on by variable {bf:`intvar'} in any observations currently in memory"'
+				nois disp `"{error}Reference value will be re-set to `r(min)'"'
+				local ref = r(min)
 			}
-			qui count if `intvar'==`reference'
-			if !`r(N)' {
-				nois disp as err `"With {bf:factor} option, {bf:reference(#)} must be a value taken on by variable {bf:`intvar'}"'
-				exit 198
-			}
-			local ref : copy local reference
-		}
-					
-		qui levelsof `intvar', local(levs)
-		foreach i of local levs {
-			cap confirm integer number `i'
-			if _rc {
-				nois disp as err `"With {bf:factor} option, variable {bf:`intvar'} must only take on integer values"'
-				exit 198
-			}
-			if `i'!=`ref' {
-				qui gen byte _Fac`i' = (`intvar'==`i')
-				qui gen byte _TrtFac`i' = _Trt * _Fac`i'
-				
-				local fac_coefs `fac_coefs' _Fac`i'
-				local int_coefs `int_coefs' _TrtFac`i'
-			}
-			else {
-				qui gen byte _TrtFac`i' = _Trt * (`intvar'==`i')
-				local ref_coef _TrtFac`i'
-			}
-		}
-		
-		local sglabel : value label `intvar'
-		if "`sglabel'"!="" {
-			tempfile sglabfile
-			qui label save `sglabel' using `sglabfile'
 		}
 	}
 	
+	// continuous `intvar'
 	else {
+		cap assert `"`facvars'"'==`""'
+		if _rc {
+			nois disp as err "Error in isolating covariate variable(s)"
+			exit 198
+		}
+		
 		if `"`saving'"'!=`""' {
 			nois disp as err "Cannot use option {bf:saving()} with continuous interactions"
 			exit 198
@@ -117,59 +250,124 @@ program define ipdfloat, eclass
 		if `"`clear'"'!=`""' {
 			nois disp as err "Cannot use option {bf:clear} with continuous interactions"
 			exit 198
+		}	
+		if `"`sepgroups'"'!=`""' {
+			nois disp as err "Cannot use option {bf:sepgroups} with continuous interactions"
+			exit 198
+		}	
+	
+		local intvarlab : variable label `intvar'
+		tokenize `intvarlab', parse("*")
+		cap {
+			assert `"`2'"'==`"*"'
+			assert `"`4'"'==`""'
+			summ `3', meanonly
 		}
-		if `"`reference'"'==`""' {
-			summ `intvar' if `touse', meanonly
-			qui gen double _Fac = `intvar' - r(mean)		// centered at mean
+		if _rc {
+			nois disp as err "Error in identification of treatment-by-subgroup interaction terms"
+			exit 198
+		}
+		local intvar : copy local 3
+		nois disp `"Note: Interaction variable {bf:`intvar'} will be treated as continuous"'
+		
+		// find reference value
+		local ref : char `intvar'[omit]
+		if `"`ref'"'==`""' {
+			summ `intvar', meanonly
+			local ref = r(mean)
 		}
 		else {
-			cap confirm number `reference'
-			if _rc {
-				nois disp as err `"Option {bf:reference(#)} must contain a single numeric value"'
-				exit 198
+			confirm number `ref'
+			summ `intvar', meanonly
+			if !inrange(`ref', `r(min)', `r(max)') {
+				summ `intvar', meanonly
+				nois disp `"{error}Reference value `ref' does not lie within the range of variable {bf:`intvar'} among the observations currently in memory"'
+				nois disp `"{error}Reference value will be re-set to `r(mean)'"'
+				local ref = r(mean)
 			}
-			summ `intvar' if `touse', meanonly
-			qui gen double _Fac = `intvar' - `reference'	// centered at specified reference
-		}
-		qui gen double _TrtFac = _Trt * _Fac
-		local fac_coefs _Fac
-		local int_coefs _TrtFac
+		}		
+	}
+
+	cap assert `: word count `usevars'' == `k'
+	if _rc {
+		nois disp as err "Error in identification of treatment-by-subgroup interaction terms"
+		exit 198
 	}
 	
 	
-	*** Find interaction effect(s)  ( = contrasts if `factor')
+	// Note:
+	// `command' should be the same as:
+	// `cmdname' `depvar' `trtvar' `intvars' `facvars'/`covars' `other'
+	// (where `"`usevars'"' == `"`trtvar' `intvars'"')
+	if "`showmodels'"=="" local quietly quietly
 	
-	// QUICK AND DIRTY!!
-	// remove `trtvar' and `intvar' from `command', to be replaced with the variables defined above
-	local command_new = subinstr(`"`command'"', `"`poolvars'"', `"_Trt `int_coefs' `fac_coefs'"', 1)	
-	
+	// Interaction effects (contrasts)
 	preserve
-		qui mvmeta_make `command_new' if `touse', usevars(_Trt `int_coefs') names(_yInt _VInt) by(`study') ppfix(check) hard clear
+		qui xi, prefix(_J) : mvmeta_make `command' if `touse', `cmdopts' usevars(`usevars') /*names(_yInt _SInt)*/ by(`study') ppfix(check) `hard' names(y S) `collapse_opt' nodetails clear
+		local yvars : colnames e(b)
+		
+		local allvars `"`usevars' `facvars'"'
+		local others : list yvars - allvars
+		
+		gettoken trtvar intvars : usevars
+		local vlist
+		local k_check = 1
+		foreach v of local intvars {
+			local vlist `vlist' y`v'
+			local ++k_check
+		}
+		assert `k_check'==`k'
 
-		local vlist				
-		foreach v of local int_coefs {
-			local vlist `vlist' _yInt`v'
+		local sigmagamma fixed		// TEMP ONLY
+		
+		/* FOLLOWING SECTION OF CODE IS IDENTICAL TO -metafloat */
+		nois disp as text _n "Test of interaction(s):"
+		`quietly' mvmeta y S, vars(`vlist') print(`print') `sigmagamma' `soptions' `eformopt'
+		nois test `vlist'
+		local chi2_int = r(chi2)
+		local df_int = r(df)
+		local p_int = r(p)
+
+		local k1 = `k' - 1
+		tempname VarGammaHat GammaHat SigmaGamma Chol
+		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
+		matrix define `GammaHat'    = e(b)[1,       1..`k1']
+		matrix define `SigmaGamma'  = e(Sigma)
+		
+		// extract cholesky matrix of Sigma
+		if `"`structure'"'=="unstructured" {
+			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
+			// so don't bother packing them up into a matrix; we're only going to unpack them again later		
+			matrix define `Chol' = e(b)[1, `k'...]
+		}
+		else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
+			local tau = e(b)[1, `k']
+			cholesky2 `SigmaGamma' `Chol'
+			matrix define `Chol' = sign(`tau') * `Chol'
+		}
+		else if `"`structure'"'=="randombeta" {
+			matrix define `Chol' = J(`k1', `k1', 0)
 		}
 		
-		mvmeta _yInt _VInt, vars(`vlist') fixed
-		test `vlist'
+		local rownames_eb : rownames e(b)
+		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''
+		matrix coleq `GammaHat' = :
+		matrix coleq `VarGammaHat' = :
+		matrix roweq `VarGammaHat' = :		
+		/* END SECTION OF CODE */
 		
-		tempname GammaHat VarGammaHat
-		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
-		matrix define `GammaHat'    = e(b)[1,       1..`k1']'
-		
-		if "`saving'"!="" | "`clear'"!="" {
+		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 			
-			if "`sepgroups'"=="" {
-				// qui levelsof `intvar', local(levs)
+			tokenize intvars
+			if `"`sepgroups'"'==`""' {
+				qui levelsof `intvar', local(levs)
+				rename y_J`trtvar' _y_ES`ref'
+				qui gen double _y_seES`ref' = sqrt(S_J`trtvar'_J`trtvar')
+				
 				foreach i of local levs {
-					if `i'==`ref' {
-						rename _yInt_Trt _y_ES`i'
-						qui gen double _y_seES`i' = sqrt(_VInt_Trt_Trt)
-					}
-					else {
-						qui gen double _y_ES`i' = _y_ES`ref' + _yInt_TrtFac`i'
-						qui gen double _y_seES`i' = sqrt(_VInt_Trt_Trt + _VInt_TrtFac`i'_TrtFac`i' + 2*_VInt_Trt_TrtFac`i')
+					if `i'!=`ref' {
+						qui gen double _y_ES`i' = _y_ES`ref' + y_J``i''
+						qui gen double _y_seES`i' = sqrt(S_J`trtvar'_J`trtvar' + S_J``i''_J``i'' + 2*S_J`trtvar'_J``i'')
 					}
 				}
 				local extra _y_ES* _y_seES*
@@ -178,8 +376,8 @@ program define ipdfloat, eclass
 						
 			foreach i of local levs {
 				if `i'!=`ref' {
-					rename _yInt_TrtFac`i' _yInt_ES`i'
-					qui gen double _yInt_seES`i' = sqrt(_VInt_TrtFac`i'_TrtFac`i')
+					rename y_J``i'' _yInt_ES`i'
+					qui gen double _yInt_seES`i' = sqrt(S_J``i''_J``i'')
 				}
 			}
 			
@@ -189,131 +387,174 @@ program define ipdfloat, eclass
 			tempfile interactions
 			qui save `interactions'
 		}
-	restore	
 
-	// Treatment effect at reference value / in reference subgroup
+	restore
+	
+	// Treatment effect at reference value (if continuous), or in reference subgroup (if factor)
 	tempvar offset offset_h
 	qui gen double `offset_h' = .
 	qui gen double `offset' = 0
 
-	tokenize `int_coefs'
+	tokenize `intvars'
 	forvalues i = 1 / `k1' {
-		qui replace `offset' = `offset' + `GammaHat'[`i',1]*``i''
+		qui replace `offset' = `offset' + `GammaHat'[1, `i']*``i''
 	}
+
+	// setup offset
+	unabcmd `cmdname'
+	if inlist(`"`r(cmd)'"', "regress", "mixed") {
+		tempvar depvar_offset
+		qui gen double `depvar_offset' = `depvar' - `offset'
+		local depvar2 : copy local depvar_offset
+	}
+	else {
+		local offset_opt offset(`offset')
+		local depvar2 : copy local depvar
+	}
+
+	// NOTE: commands allowing offset() option:
+	// binreg, biprobit, clogit, cloglog, cpoisson, expoisson, fracreg, glm, heckman, heckoprobit, heckpoisson, heckprobit, hetoprobit, hetprobit,
+	// intreg, ivpoisson, logistic, logit, nbreg, gnbreg, ologit, oprobit, poisson, probit, scobit, tnbreg, tobit, tpoisson, truncreg, zinb, ziologit, zioprobit, zip
 	
-	if `"`factor'"'!=`""' {
+	// for now, just assume everything except -regress-, -xtreg- and -mixed-
+	
+	if `"`sepgroups'"'==`""' | `"`factor'"'==`""' {
+		
+		// remove `intvars' from `command'		
+		local command_new `cmdname' `depvar2' `trtvar' `facvars' `covars' `other'
+		local usevars `trtvar'
 		
 		// fixed-effects: do it using -ipdmetan- instead of -mvmeta-
-		if "`sepgroups'"=="" {
-			
-			// QUICK AND DIRTY!!
-			// remove `trtvar' and `intvar' from `command', to be replaced with the variables defined above
-			local command_new = subinstr(`"`command'"', `"`poolvars'"', `"_Trt `fac_coefs'"', 1)
-			
-			qui ipdmetan_new, study(`study') poolvar(_Trt) nograph norsample : `command_new' if `touse', offset(`offset')
-			tempname ThetaHat VarThetaHat
-			matrix define `VarThetaHat' = r(se_eff)^2
-			matrix define `ThetaHat'    = r(eff)
-		}
+		/*
+		qui ipdmetan, study(`study') poolvar(`trtvar') nograph norsample : `command_new' if `touse', `offset_opt' `cmdopts'
+		tempname ThetaHat VarThetaHat
+		matrix define `VarThetaHat' = r(se_eff)^2
+		matrix define `ThetaHat'    = r(eff)
+		*/
 		
-		else {
-			// QUICK AND DIRTY!!
-			// remove `trtvar' and `intvar' from `command', to be replaced with the variables defined above
-			local command_new = subinstr(`"`command'"', `"`poolvars'"', `"`ref_coef' `int_coefs' `fac_coefs'"', 1)	
-			
-			preserve
-				qui mvmeta_make `command_new' if `touse', offset(`offset') usevars(`ref_coef' `int_coefs') names(_y _S) by(`study') ppfix(check) hard clear
-				
-				local vlist
-				local use_coefs `ref_coef' `int_coefs'
-				foreach v of local use_coefs {
-					local vlist `vlist' _y`v'
-				}
-				qui mvmeta _y _S, vars(`vlist') fixed commonparm
-			
-				tempname ThetaHat VarThetaHat
-				matrix define `VarThetaHat' = e(V)[1,1]
-				matrix define `ThetaHat'    = e(b)[1,1]
-				
-				if "`saving'"!="" | "`clear'"!="" {
-					keep Trial _y* _S*
-					qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)					
-					tempfile subgroups
-					qui save `subgroups'
-				}
-			restore
-		}
-	}
-	
-	else {
-		/* STILL TO DO !!! */
-		preserve
-			qui ipdmetan_new, study(`study') poolvar(_Trt) nograph norsample clear : `command_new' if `touse', offset(`offset')
-			tempname ThetaHat VarThetaHat
-			matrix define `VarThetaHat' = r(se_eff)^2
-			matrix define `ThetaHat'    = r(eff)
-			
+		/*
+		if `"`factor'"'==`""' {
 			rename _STUDY Trial
 			keep Trial _ES _seES
 			tempfile subgroups
 			qui save `subgroups'
+		}
+		*/
+	}
+		
+	else {
+		// replace `trtvar' with `refintvar'
+		tempvar refintvar
+		qui gen byte `refintvar' = `trtvar' * (`intvar'==`ref')
+		
+		local command_new `cmdname' `depvar2' `refintvar' `intvars' `facvars' `covars' `other'
+		local usevars `refintvar' `intvars'
+		
+		/*
+		preserve
+			qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`useintvars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+			mvmeta y S, fixed commonparm
+		
+			tempname ThetaHat VarThetaHat
+			matrix define `VarThetaHat' = e(V)[1,1]
+			matrix define `ThetaHat'    = e(b)[1,1]
+			
+			if "`saving'"!="" | "`clear'"!="" {
+				keep Trial _y* _S*
+				qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)					
+				tempfile subgroups
+				qui save `subgroups'
+			}
 		restore
+		*/
 	}
 
+	local sigmabeta fixed		// TEMP ONLY
 	
+	preserve
+		if "`showmodels'"!="" nois disp as text _n `"Estimation of floating subgroup for reference category:"'
+		qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+		`quietly' mvmeta y S, print(`print') commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
+		// mvmeta y S, fixed commonparm
+
+		tempname ThetaHat VarThetaHat
+		matrix define `VarThetaHat' = e(V)[1,1]
+		matrix define `ThetaHat'    = e(b)[1,1]
+		
+		// extract fitted BS variance and derive SigmaBeta
+		if `"`sepgroups'"'!=`""' {
+			tempname SigmaU L SigmaBeta
+			matrix define `SigmaU' = e(Sigma)
+			matrix define `L' = J(`k', `k1', 0), J(`k', 1, 1)
+			matrix define `L'[2, 1] = I(`k1')
+			matrix define `SigmaBeta' = `L'*`SigmaU'*`L''
+		}
+		
+		if "`saving'"!="" | "`clear'"!="" {
+			keep Trial _y* _S*
+			qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)					
+			tempfile subgroups
+			qui save `subgroups'
+		}	
+	restore
+	
+
 	*** Obtain "delta method" gradients, in order to form the final variance-covariance matrix
 	tempname Grad h eff_pos eff_neg
 	matrix define `Grad' = J(1, `k1', .)
 
 	forvalues i = 1 / `k1' {
-		scalar `h' = max(abs(`GammaHat'[1,`i']), 1)*sqrt(`eps')
+		scalar `h' = max(abs(`GammaHat'[1, `i']), 1)*sqrt(`eps')
 
 		local sign "+"
-		if "`backwards'"!="" local sign "-"
-		else if "`forwards'"=="" scalar `h' = `h'/2
-		
+		if `"`backwards'"'!=`""' local sign "-"
+		else if `"`forwards'"'==`""' scalar `h' = `h'/2
+	
+		// update offset
 		qui replace `offset_h' = `offset' `sign' `h'*``i''
-		
-		if ("`factor'"!="" & "`sepgroups'"=="") | "`factor'"=="" {
-			qui ipdmetan_new, study(`study') poolvar(_Trt) nograph norsample : `command_new' if `touse', offset(`offset_h')
-			scalar `eff_pos' = r(eff)
+		unabcmd `cmdname'
+		if inlist(`"`r(cmd)'"', "regress", "xtreg", "mixed") {
+			qui replace `depvar_offset' = `depvar' - `offset_h'
 		}
 		else {
-			preserve
-				qui mvmeta_make `command_new' if `touse', offset(`offset_h') usevars(`ref_coef' `int_coefs') names(_y _S) by(`study') ppfix(check) hard clear
-				local vlist
-				local use_coefs `ref_coef' `int_coefs'
-				foreach v of local use_coefs {
-					local vlist `vlist' _y`v'
-				}
-				qui mvmeta _y _S, vars(`vlist') fixed commonparm
-				scalar `eff_pos' = e(b)[1,1]
-			restore
+			local offset_opt offset(`offset_h')
 		}
+		
+		/*
+		if `"`sepgroups'"'==`""' | `"`factor'"'==`""' {
+			qui ipdmetan, study(`study') poolvar(`trtvar') nograph norsample : `command_new' if `touse', `offset_opts' `cmdopts'
+			scalar `eff_pos' = r(eff)
+		}
+		*/
+		preserve
+			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+			qui mvmeta y S, fixed commonparm
+			scalar `eff_pos' = e(b)[1,1]
+		restore
 		
 		if `"`forwards'`backwards'"'!=`""' {
 			matrix `Grad'[1, `i'] = `sign'(`eff_pos' - `ThetaHat'[1,1])/`h'
 			continue
 		}
 
+		// update offset
 		qui replace `offset_h' = `offset' - `h'*``i''
+		unabcmd `cmdname'
+		if inlist(`"`r(cmd)'"', "regress", "mixed") {
+			qui replace `depvar_offset' = `depvar' - `offset_h'
+		}
 		
-		if ("`factor'"!="" & "`sepgroups'"=="") | "`factor'"=="" {
-			qui ipdmetan_new, study(`study') poolvar(_Trt) nograph norsample : `command_new' if `touse', offset(`offset_h')
+		/*
+		if "`sepgroups'"=="" | "`factor'"=="" {
+			qui ipdmetan, study(`study') poolvar(`trtvar') nograph norsample : `command_new' if `touse', `offset_opts' `cmdopts'
 			scalar `eff_neg' = r(eff)
 		}
-		else {
-			preserve
-				qui mvmeta_make `command_new' if `touse', offset(`offset_h') usevars(`ref_coef' `int_coefs') names(_y _S) by(`study') ppfix(check) hard clear
-				local vlist
-				local use_coefs `ref_coef' `int_coefs'
-				foreach v of local use_coefs {
-					local vlist `vlist' _y`v'
-				}
-				qui mvmeta _y _S, vars(`vlist') fixed commonparm
-				scalar `eff_neg' = e(b)[1,1]
-			restore
-		}
+		*/
+		preserve
+			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
+			qui mvmeta y S, fixed commonparm
+			scalar `eff_neg' = e(b)[1,1]
+		restore
 
 		matrix `Grad'[1, `i'] = (`eff_pos' - `eff_neg')/(2*`h')
 	}
@@ -325,10 +566,9 @@ program define ipdfloat, eclass
 		
 		matrix define `ones' = J(`k', 1, 1)
 		matrix define `Z' = J(`k', `k1', 0)
-		matrix define `Z'[2, 1] = I(`k1')	
-		matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat'
+		matrix define `Z'[2, 1] = I(`k1')
+		matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat''
 
-		// matrix define grad = grad2, grad3
 		matrix define `A' = `ones'*`Grad' + `Z'
 		matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
 	}
@@ -339,8 +579,25 @@ program define ipdfloat, eclass
 		cap drop _Int_stdp
 		cap drop _Int_lci
 		cap drop _Int_uci
-		qui gen double _Int_xb = `ThetaHat'[1,1]*_Trt + `GammaHat'[1,1]*`1'
-		qui gen double _Int_stdp = sqrt(`VarThetaHat'[1,1]*_Trt + `VarGammaHat'[1,1]*((`1' + `Grad'[1,1])^2))
+		
+		qui gen double _Int_xb = `ThetaHat'[1,1]*`trtvar'
+		qui gen double _Int_stdp = .
+		tokenize `intvars'
+		forvalues i = 1 / `k1' {
+			qui replace _Int_xb = _Int_xb + `GammaHat'[1, `i']*``i''
+		}
+		
+		mata: st_view(X=., ., "`trtvar'", "`touse'")
+		mata: st_view(Z=., ., "`intvars'", "`touse'")
+		mata: VarThetaHat = st_matrix("`VarThetaHat'")
+		mata: VarGammaHat = st_matrix("`VarGammaHat'")
+		mata: GradZ = st_matrix("`Grad'")
+		mata: GradZ = Z + J(rows(Z), 1, 1) * GradZ
+		mata: Var_Xb = diag(VarThetaHat*X) + GradZ*VarGammaHat*GradZ'
+		mata: st_store(st_viewobs(X), "_Int_stdp", sqrt(diagonal(Var_Xb)))
+
+		// qui gen double _Int_xb = `ThetaHat'[1,1]*`trtvar' + `GammaHat'[1,1]*`intvar'
+		// qui gen double _Int_stdp = sqrt(`VarThetaHat'[1,1]*`trtvar' + `VarGammaHat'[1,1]*((`intvar' + `Grad'[1,1])^2))
 		qui gen double _Int_lci = _Int_xb - invnormal(.5 + `level'/200)*_Int_stdp
 		qui gen double _Int_uci = _Int_xb + invnormal(.5 + `level'/200)*_Int_stdp
 		
@@ -383,7 +640,7 @@ program define ipdfloat, eclass
 			nois disp as err "Error in colnames [NEED TO IMPROVE THIS MESSAGE]"
 			exit _rc
 		}
-		
+
 		drop _merge *_EFFECT _yInt_USE _yInt_STUDY
 		rename _y_STUDY _STUDY
 		rename _yInt_LABELS _LABELS		
@@ -427,6 +684,7 @@ program define ipdfloat, eclass
 		tempvar pooled obs
 		qui append using `pooled_ests', gen(`pooled')
 		qui gen int `obs' = _n
+
 		qui levelsof _STUDY, local(sgvals)
 		forvalues i = 1 / `k' {
 			// local x : word `i' of `sgvals`string''
@@ -480,6 +738,13 @@ program define ipdfloat, eclass
 		nois disp as text _n "Floating subgroups:"
 		ereturn display, `eformopt'
 	}
+	
+	ereturn local command     `"`command'"'
+	ereturn local command_new `"`command_new'"'
+
+	// qui drop `VarsToDrop'
+	// char define _dta[__xi__Vars__Prefix__] `OldVarsPrefix'
+	// char define _dta[__xi__Vars__To__Drop__] `OldVarsToDrop'	
 	
 end
 
