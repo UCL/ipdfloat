@@ -3,6 +3,25 @@
 // by David Fisher, Peter Godolphin, Ian White
 // (MRC Clinical Trials Unit at UCL)
 
+
+* v0.1  David Fisher 17sep2021
+// Very early version with a lot of functionalities hard-coded, mostly for test of principle
+
+* v0.2  David Fisher 28sep2021
+// Now generalisable enough to be applied (in testing) to real IPD meta-analysis data
+// but still rather clunkily coded
+
+* v0.3  David Fisher 17dec2021
+// Now automatically identifies the treatment and interaction variables so long as they are supplied explicity as the first independent variable term
+// Fully general estimation of predicted treatment effects for continuous interaction, using Mata
+
+*! v0.4  David Fisher 17jan2022
+// Overhauled code that parses the command line, now much more general
+//  - optional checks that compare direct use of "xi:command" with command built up from xi-derived covariates
+// Checks version of -metan- (requires version 4.05  David Fisher  29nov2021;  N.B. no longer uses -ipdmetan- )
+// Many functionalities from -metafloat- v0.9 copied across, e.g. random-effects, saved dataset
+//  - still to do: "design", "trend"
+
 * Syntax:
 *   ipdfloat, study(studyname) [options] : cmdname [depvar] i.trtvar*[i.]intvar [adjustment vars] [if] [in] [wgt] , [cmd_opts]
 
@@ -13,26 +32,19 @@
 *    - if factor, write i.trt*i.intvar and only a single intvar is allowed
 *    - if continuous, write i.trt*intvar1 [i.trt*intvar2 ...] and multiple intvars are allowed (e.g. to specify a FP or spline)
 
-* Note: -ipdfloat- uses old-style "xi"-based factor notation, although "xi" does not need to be explicitly written within the command.
+* Note: -ipdfloat- uses old-style "xi"-based factor notation, although "xi" itself should NOT be explicitly written within the command.
 * (ultimately we may try to redesign this command so it handles modern factor-variable notation, but no immediate need)
 
 * Reference level (for factor variable) or reference value (for first continuous variable) can be specified in advance using "char intvar[omit] #"; see -help char-
 * Otherwise, -ipdfloat- will automatically use the lowest observed factor level, or the sample mean of (first) continuous covariate
 
-* v0.1  David Fisher 17sep2021
-* v0.2  David Fisher 28sep2021 
-* v0.3  David Fisher 17dec2021
-*! v0.3.2  David Fisher 07jan2022 -- intermediate test version with some options/routines removed
-
-* Note DF 17th Dec 2021: needs to use -ipdmetan- version 4.03  David Fisher  29nov2021
-* (as yet unreleased)
 
 program define ipdfloat, eclass
 	
 	version 11.0
 	local version : di "version " string(_caller()) ":"	
 	
-	// Check that -metan- v4.05+ and -ipdmetan- v4.03+ are installed
+	// Check that -metan- v4.05+ is installed
 	cap metan
 	if `"`r(metan_version)'"'==`""' {
 		nois disp as err `"{bf:ipdfloat} requires version 4.05 or higher of {bf:metan}"'
@@ -45,480 +57,222 @@ program define ipdfloat, eclass
 			exit 499
 		}
 	}
-	cap ipdmetan
-	if `"`r(ipdmetan_version)'"'==`""' {
-		nois disp as err `"{bf:ipdfloat} requires version 4.03 or higher of {bf:ipdmetan}"'
-		exit 499
-	}
-	else {
-		local reqd_version = 4.03
-		if `r(ipdmetan_version)' < `reqd_version' {
-			nois disp as err `"{bf:ipdfloat} requires version 4.03 or higher of {bf:ipdmetan}"'
-			exit 499
-		}
-	}
+	// NOTE: if random-effects, also requires -mvmeta- version 3.5.1 # Ian White # 21dec2021
+	// but currently no easy way to test for this
 	
 	_on_colon_parse `0'
 	local 0       `"`s(before)'"'
 	local command `"`s(after)'"'
 	
 	syntax, STUDY(varname) ///
-		[ TRTVAR(varname numeric) INTVARs(varlist numeric) ///
-		  SHOWmodels HARD SEPGroups EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR ]
+		[ TRTVAR(passthru) INTVARs(passthru) ///
+		  SHOWmodels HARD noSEPGroups AUGVARiance(real 1e5) EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR ///
+		  PRINT(string) * ]		// -mvmeta- options
 
+	_get_eformopts, eformopts(`options') allowed(__all__) soptions
+	local eformopt eform(`"`s(str)'"')
+	local soptions `"`s(options)'"'
+	
 	`version' _prefix_command ipdfloat, level(`level') : `command'
 	local cmdname `"`s(cmdname)'"'
 	local cmdopts `"`s(options)'"'
 	local rest `"`s(anything)'"'	
+	if substr(`"`cmdname'"', 1, 2)!="st" {		// survival commands don't have a dependent variable
+		gettoken depvar rest : rest
+	}
 	
 	tempvar touse
 	mark `touse' `s(if)' `s(in)'
 	markout `touse' `study', strok
 	
 	
-	*** Find treatment and interaction effect(s)  ( = contrasts if `factor')
-	// Assume first element of `command' is of the form: i.`trtvar'*`i'`intvar'
-	if substr(`"`cmdname'"', 1, 2)!="st" {		// survival commands don't have a dependent variable
-		gettoken depvar rest : rest
-		// local depvar : copy local cmdname
-		// gettoken cmdname : rest
-	}
+	*** Find treatment and interaction effect(s)  ( = contrasts if factor-variable)
+	// First, identify `trtvar'
+	// then search `command' for terms beginning "i.`trtvar'* ... "
+	// and then finally run -xi- on the entire `command'
+	// use the results to identify correct variables to use later, with -mvmeta-
+	ProcessTerms `rest' if `touse', `trtvar' `intvars'
 	
-	if `"`trtvar'"'==`""' {
-		tokenize `"`rest'"', parse(" .*")
-		unab trtvar : `3'
-		capture {
-			assert `"`1'`2'"'==`"i."'
-			assert `"`4'"'==`"*"'
-		}
-		if _rc {
-			nois disp as err  "Could not identify treatment variable. If option {bf:trtvar()} is not specified,"
-			nois disp as err `" then first element of {it:command} should be of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
-			exit 198
-		}
-	}
-	cap tab `trtvar' if `touse'
-	if _rc {
-		tab `trtvar' if `touse'
-	}
-	cap assert `r(r)'==2
-	if _rc {
-		nois disp as err "Treatment variable {bf:`trtvar'} must take exactly two values"
-		exit _rc
-	}
+	local trtvar  `s(trtvar)'		// xi, prefix(_J) i.trtvar
+	local intvars `s(intvars)'		// xi, prefix(_J) i.trtvar*[i.]intvar1 [i.trtvar*intvar2 ... ]  = _J[trt]X[int]_1_`i' if factor;  else = _J[trt]X[int]_1
+	local covars  `s(covars)'		// main effect(s) of intvar(s)
+	local adjvars `s(adjvars)'		// other adjustment variables (with xi applied if appropriate) not part of the main treatment-covariate interaction
+	local facvar  `s(facvar)'		// if -factor- , this contains the original factor-variable
+	local ref     `s(ref)'			// reference value and/or category
 	
-	// find reference value for treatment variable
-	local trtref : char `trtvar'[omit]
-	if `"`trtref'"'==`""' {
-		summ `trtvar', meanonly
-		local trtref = r(min)
+	local k1 : word count `intvars'
+	local k = `k1' + 1
+	
+	// sreturn clear	// in advance of running s-class subroutines TransMatrix and CovStruct
+	
+	// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
+	// also define trend vector `d' if appropriate [NOT IMPLEMENTED YET IN -ipdfloat-]
+	// [ subroutine taken directly from -metafloat- ]
+	tempname T d
+	if `"`facvar'"'!=`""' {
+		TransMatrix `T' `d', subgroup(`facvar') `soptions'
+		local sglist `"`s(sglist)'"'
+		local soptions `"`s(options)'"'
+		assert `k'==`s(k)'
+		assert `ref'==`s(ref)'
+		// local ref `s(ref)'
+		/*
+		if `k' < 3 {
+			local trend notrend
+			local forcetrend
+		}
+		*/
 	}
 	else {
-		confirm integer number `trtref'
-		qui count if `trtvar'==`trtref'
-		if !`r(N)' {
-			summ `trtvar', meanonly
-			nois disp `"{error}Reference value `trtref' is not taken on by variable {bf:`trtvar'} in any observations currently in memory"'
-			nois disp `"{error}Reference value will be re-set to `r(min)'"'
-			local trtref = r(min)
-		}
-	}	
-	
-	// Now search `rest' for terms beginning "i.trt* ... "
-	local specintvars : copy local intvars
-	local remain : copy local intvars
-	gettoken el newrest : rest
-	local k = 1						// for treatment
-	while `"`el'"'!=`""' {
-		tokenize `"`el'"', parse(".*|")
-		
-		if lower(`"`1'`2'"')==`"i."' {
-			unab newvar : `3'
-			local facvars `facvars' `el'
-			if `"`factor'"'!=`""' {
-				gettoken el newrest : newrest
-				continue
-			}
-		
-			if inlist(`"`4'"', `"*"', `"|"') & `"`newvar'"'==`"`trtvar'"' {
-				
-				// factor
-				if lower(`"`5'`6'"')==`"i."' {
-					unab newvar : `7'
-					if (`: list newvar in intvars') & (`: word count `intvars'' > 1) {
-						nois disp as err `"If option {bf:intvars()} is specified, and contains a factor variable, then no other variables may be specified to this option"'
-						exit 198
-					}
-					if `"`intvars'"'==`""' | `"`newvar'"'==`"`intvars'"' {
-						local remain : list remain - newvar
-						local intvars : copy local newvar
-						local factor factor
-						// local adjvars `adjvars' `newrest'
-						gettoken el newrest : newrest
-						continue
-					}
-					// else local adjvars `adjvars' `el'
-				}
-				
-				// continuous
-				else {
-					unab newvar : `5'
-					if `"`intvars'"'==`""' | `: list newvar in intvars' {
-						local remain : list remain - newvar
-						local covars `covars' `newvar'
-						local ++k
-					}
-					// else local adjvars `adjvars' `el'
-				}
-			}
-			// else local adjvars `adjvars' `el'
-		}
-		else local adjvars `adjvars' `el'
-		gettoken el newrest : newrest
+		matrix define `T' = I(`k')
 	}
 	
-	if `"`remain'"'!=`""' {
-		nois disp as err `"Failed to identify interaction(s) between treatment variable {bf:`trtvar'} and covariate(s) {bf:`remain'}"'
-		nois disp as err `"Please check {it:command} and {bf:intvars()} option, and try again"'
-		exit 198
+	// Setup covariance structures
+	// [ subroutine taken directly from -metafloat- ]
+	tempname sgmat propU
+	CovStruct `sgmat' `propU', k(`k') trans(`T') /*facvar(`facvar') `sepgroups'*/ `soptions'
+	local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
+	local sigmagamma `s(sigmagamma)'
+	local sigmabeta  `s(sigmabeta)'
+	local naive      `s(naive)'			// "naive" = undocumented option; don't constrain SigmaBeta and SigmaGamma to be linked
+	local soptions `"`s(options)'"'
+
+	if `"`facvar'"'==`""' | `"`sepgroups'"'!=`""' { 	// if non-factor (i.e. continuous); or factor without by-subgroup covariance structure
+		if `"`naive'"'!=`""' {
+			nois disp as err `"Option {bf:naive} is only valid with categorical covariates"'
+			exit 198
+		}
+		if `"`structure'"'!=`"fixed"' {
+			local sigmabeta bscov(unstructured)
+			local naive naive
+		}
 	}
 	
-	if `"`factor'"'!=`""' {				// factor-variable; recall that `intvars' must contain only a single varname
-		cap tab `intvars' if `touse'
+	/*	// TREND NOT IMPLEMENTED YET IN -ipdfloat-
+	if `"`forcetrend'"'!=`""' {
+		cap assert inlist(`"`structure'"', "fixed", "randombeta") | `"`s(default)'"'!=`""'		// either "fixed" or "randombeta" specified, or no structure was specified
 		if _rc {
-			tab `intvars' if `touse'
-		}
-		local k = r(r)		// can overwrite previously-defined local k
-		if `k'>10 {
-			nois disp as err `"Too many factor levels in variable {bf:`intvars'} (max of 10)"'
-			exit 198
-		}
-				
-		// find reference value
-		local ref : char `intvars'[omit]
-		if `"`ref'"'==`""' {
-			summ `intvars', meanonly
-			local ref = r(min)
-		}
-		else {
-			confirm integer number `ref'
-			qui count if `intvars'==`ref'
-			if !`r(N)' {
-				summ `intvars', meanonly
-				nois disp `"{error}Reference value `ref' is not taken on by variable {bf:`intvars'} in any observations currently in memory"'
-				nois disp `"{error}Reference value will be re-set to `r(min)'"'
-				local ref = r(min)
-			}
+			nois disp as err `"cannot specify {bf:bscovariance(`structure')} with {bf:forcetrend}; random-effects structure is implied by use of trend"'
+			exit 184
 		}
 	}
+	*/
 	
-	else {		// continuous
-		if `"`intvars'"'!=`""' {
-			local problem : list intvars - covars
-			if `"`problem'"'!=`""' {
-				local p1 : word 1 of `problem'
-				nois disp as err `"Could not find term {bf:i.`trtvar'*`p1'} in {it:command}"'
-				exit 198
-			}
-		}
-		else {
-			local intvars : copy local covars	// use all of the identified `covars'
-		}
-		
-		// find reference value
-		local intvar1 : word 1 of `intvars'
-		local ref : char `intvar1'[omit]
-		if `"`ref'"'==`""' {
-			summ `intvar1', meanonly
-			local ref = r(mean)
-		}
-		else {
-			confirm number `ref'
-			summ `intvar1', meanonly
-			if !inrange(`ref', `r(min)', `r(max)') {
-				summ `intvar1', meanonly
-				nois disp `"{error}Reference value `ref' does not lie within the range of variable {bf:`intvar1'} among the observations currently in memory"'
-				nois disp `"{error}Reference value will be re-set to `r(mean)'"'
-				local ref = r(mean)
-			}
-		}
-		
-		// options not allowed with continuous interactions
-		if `"`saving'"'!=`""' {
-			nois disp as err "Cannot use option {bf:saving()} with continuous interactions"
-			exit 198
-		}
-		if `"`clear'"'!=`""' {
-			nois disp as err "Cannot use option {bf:clear} with continuous interactions"
-			exit 198
-		}	
-		if `"`sepgroups'"'!=`""' {
-			nois disp as err "Cannot use option {bf:sepgroups} with continuous interactions"
-			exit 198
-		}
-	}
-	local k1 = `k' - 1
+	local end = 0
+	local r : list posof `"`ref'"' in sglist
+	local usevars `trtvar' `intvars'
+	if `"`facvar'"'!=`""' {				// REVISIT: what to do here if *not* factor??
+		forvalues i = 1/`k1' {
+			local intvari : word `i' of `intvars'
+			local covari  : word `i' of `covars'
 
-	// so far, macros defined are:
-	// `covars' (only if continuous; if factor, defined below)
-	// `trtvar', `intvars'
-	// `facvars', `adjvars'
-
-	// `covars' (if factor)
-	// `adjfacvars'
-	// `usetrtvar', `useintvars'
-	
-	// Now run -xi- on the supplied command
-	// and use the results to check again for consistency and for correct variables to use
-	qui xi, prefix(_J) `rest'
-	local OldVarsPrefix : char _dta[__xi__Vars__Prefix__]
-	local OldVarsToDrop: char _dta[__xi__Vars__To__Drop__]
-	local i = 0
-	foreach el of local OldVarsPrefix {
-		local ++i
-		if `"`el'"'==`"_J"' {
-			local eli : word `i' of `OldVarsToDrop'
-			local VarsToDrop `VarsToDrop' `eli'
-			
-			local intvarlab : variable label `eli'
-			tokenize `"`intvarlab'"', parse("*&")
-			args trtpart symbol intpart rest
-			
-			// parse first part (treatment)
-			local open
-			local close
-			tokenize `"`trtpart'"', parse("(=)")
-			if `"`1'"'!=`"("' {
-				cap {
-					assert `"`factor'"'!=`""' | `"`symbol'"'==`""'
-					assert `"`2'"'==`"=="'
-					assert `"`4'"'==`""'
-				}
-				args trtname eq trtval					// format:  trtname==trtval [& intname==intval]
+			// extract stem and form Ibase (only do this once)
+			if !`end' {
+				local stem = reverse(`"`covari'"')			// reverse...
+				gettoken val stem : stem, parse("_")		// ...so that we can remove the final "_#" stub (where `val'==#)
+				local Ibase = reverse(`"`stem'"') + "`ref'"
+				local Ibase = subinstr(`"`Ibase'"', `"_J"', `"_I"', 1)	// finally, switch prefix _J for _I
+				local end = 1
 			}
-			else {
-				cap {
-					assert `"`1'`3'`5'"'==`"(==)"'
-					assert `"`6'"'==`""'
-				}
-				args open trtname eq trtval close		// format:  (trtname==trtval)*intname
-			}
-			if _rc ExitErr
 			
-			// parse second part (interaction)
-			tokenize `"`intpart'"', parse("=")
-			args intname eq intval
+			local varlab : variable label `covari'
+			tokenize `"`varlab'"', parse("=")
+			args sgname eq sgval
 			cap {
-				assert `"`rest'"'==`""'
-				assert inlist(`"`symbol'"', `""', `"*"', `"&"')
-				assert `"`symbol'"'==`""' if `"`intname'"'==`""'
-				assert `"`symbol'"'==`"*"' & `"`intname'"'!=`""' & `"`eq'"'==`""' if `"`open'"'!=`""'
-				assert `"`intval'"'!=`""' & `"`eq'"'==`"=="' if `"`open'"'==`""' & `"`symbol'"'==`"&"'
+				assert `"`sgname'"'==`"`facvar'"'
+				assert `"`eq'"'==`"=="'
+				confirm number `sgval'
 				assert `"`4'"'==`""'
 			}
-			if _rc ExitErr
-			// if not treatment (and also not interaction with treatment), should be either:
-			//  - a main effect of a factor-variable covariate, or
-			//  - part of another interaction which is being adjusted-for but is not relevant to the procedure.
-			if `"`trtname'"'!=`"`trtvar'"' {
-				cap assert `"`intname'"'!=`"`trtvar'"'
-				if _rc {
-					nois disp as err "Cannot specify an interaction term where the treatment variable is in second position"
-					exit 198
-				}
-				if `"`factor'"'!=`""' & `"`trtname'"'==`"`intvars'"' {
-					cap assert `trtval'!=`ref'
-					if _rc ExitErr
-					if `"`intpart'"'==`""' local covars `covars' `eli'
-					else {
-						// (non-treatment) interaction with continuous covariate; need to save main-effect of this covariate
-						if `"`symbol'"'==`"*"' local adjfacvars `adjfacvars' `intname'
-						local adjfacvars `adjfacvars' `eli'
-					}
-				}
-				else {
-					// (non-treatment) interaction with continuous covariate; need to save main-effect of this covariate
-					if `"`symbol'"'==`"*"' local adjfacvars `adjfacvars' `intname'
-					local adjfacvars `adjfacvars' `eli'
-				}
-				continue
+			if _rc {
+				nois disp as err `"Something has gone wrong involving -xi-"'
+				exit 198
 			}
-			cap assert `trtval' != `trtref'
-			if _rc ExitErr
-					
-			// if treatment variable alone (i.e. *not* interaction), then continue to process next element
-			if `"`symbol'"'==`""' {
-				local usetrtvar : copy local eli
-				continue
-			}
-	
-			// at this point we definitely have a treatment-covariate interaction
-			if `"`factor'"'!=`""' {
-				
-				// if treatment interacted with a continuous covariate
-				if `"`open'"'!=`""' & `"`specintvars'"'==`""' {
-					nois disp as err "Cannot interact treatment with both a factor and a continuous variable"
-					exit 198
-				}
-				
-				cap assert `"`intname'"'==`"`intvars'"'
-				if _rc {
-					// if user-specified `intvars', then ignore it and add to `adjfacvars'
-					if `"`specintvars'"'!=`""' {
-						local adjfacvars `adjfacvars' `eli'
-						continue
-					}
-					
-					// otherwise, exit with error
-					else {
-						nois disp as err "Cannot interact treatment with more than one factor variable"
-						exit 198
-					}
-				}
-				cap {
-					assert `"`eq'"'==`"=="'
-					assert `intval' != `ref'
-				}
-			}
-			else {
-				cap confirm variable `intpart'
-				local intname : copy local intpart
-			}
-			if _rc ExitErr
 			
-			// if successful, add to `useintvars' (unless excluded from user-specified `intvars')
-			if `"`specintvars'"'==`""' | `: list intname in specintvars' {
-				local useintvars `useintvars' `eli'
-				local intnames `intnames' `intname'
-			}		
-			else local adjfacvars `adjfacvars' `eli'
-		}	
-	}
+			// insert baseline expression `Ibase' into macro `Iyvars' at appropriate point
+			// (for matrix labelling prior to displaying of results)
+			if `i' > `k' continue, break
+			if `i'==`r' local Iyvars `Iyvars' y`Ibase'
+			local Iyvar = subinstr(`"y`covari'"', `"_J"', `"_I"', 1)
+			local Iyvars `Iyvars' `Iyvar'
+			local Jyvars `Jyvars' y`covari'
 
-	cap {
-		confirm variable `trtvar'
-		confirm variable `intvars'
-		confirm numeric variable `usetrtvar'
-		confirm numeric variable `useintvars'
-		assert `: word count `useintvars'' == `k1'
+			if `sgval'!=`ref' {
+				local useJyvars `useJyvars' y`intvari'		// REVISIT: think of better name
+			}
+		}
+	}
+	
+	// TEMP -- REVISIT
+	else {
+		forvalues i = 1/`k1' {
+			local intvari : word `i' of `intvars'
+			local useJyvars `useJyvars' y`intvari'
+		}
+	}
 		
-		if `"`factor'"'==`""' {
-			assert `: list intvars === intnames'		// this is trivial; remove??
-			assert `: word count `intvars''==`: word count `useintvars''
-		}
-	}
-	if _rc ExitErr
 	
-	// to form `command':
-	// take `adjvars' and replace `facvars' with `adjfacvars'
-	
-	local adjfacvars : list uniq adjfacvars
-	
-	disp `"trtvar: `trtvar'"'
-	disp `"intvars: `intvars'"'
-	disp `"facvars: `facvars'"'
-	disp `"adjvars: `adjvars'"'
-	disp `"adjfacvars: `adjfacvars'"'
-	disp `"covars: `covars'"'						// main effects of interacted covars
-	disp `"usevars: `usetrtvar' `useintvars'"'	
-	disp `"k = `k'"'
-	
-	disp _n `"-----------"'
-	
-	disp trim(itrim(`"`command'"'))
-	disp trim(itrim(`"`cmdname' `depvar' `facvars' `adjvars'"'))
-	local cmd2 `"`cmdname' `depvar' `facvars' `adjvars'"'
-	assert `: list command === cmd2'
-	disp `"`cmdname' `depvar' `usetrtvar' `useintvars' `covars' `adjfacvars' `adjvars'"'
-	
-	qui `cmdname' `depvar' `usetrtvar' `useintvars' `covars' `adjfacvars' `adjvars'
-	local eN_2 = e(N)
-	local eN_fail_2 = e(N_fail)
-	local ell_0_2 = e(ll_0)
-	local ell_2 = e(ll)
-
-	_ms_omit_info e(b)
-	mat omit_info_2 = r(omit)
-	local yvars2 : colnames e(b)
-	local c : word count `yvars2'
-	forvalues i=1/`c' {
-		local omit = omit_info_2[1, `i']
-		if !`omit' {
-			local newyvars2 `newyvars2' `: word `i' of `yvars2''
-		}
-	}
-
-	qui xi, prefix(_J): `command'
-	local eN_1 = e(N)
-	local eN_fail_1 = e(N_fail)
-	local ell_0_1 = e(ll_0)
-	local ell_1 = e(ll)
-
-	_ms_omit_info e(b)
-	mat omit_info_1 = r(omit)
-	local yvars1 : colnames e(b)
-	local c : word count `yvars1'
-	forvalues i=1/`c' {
-		local omit = omit_info_1[1, `i']
-		if !`omit' {
-			local newyvars1 `newyvars1' `: word `i' of `yvars1''
-		}
-	}
-
-	disp `"`newyvars1' == `newyvars2'"'
-	assert `: list newyvars1 === newyvars2'
-	disp `"`eN_1' == `eN_2'"'
-	assert `eN_1'==`eN_2'
-	disp `"`eN_fail_1' == `eN_fail_2'"'
-	assert `eN_fail_1'==`eN_fail_2'
-	disp `"`ell_0_1' == `ell_0_2'"'
-	assert float(`ell_0_1')==float(`ell_0_2')
-	disp `"`ell_1' == `ell_2'"'
-	assert float(`ell_1')==float(`ell_2')
-	
-	exit 0
-	// UP TO HERE
-	
-	// Note:
-	// `command' should be the same as:
-	// `cmdname' `depvar' `usetrtvar' `useintvars' `covars' `adjvars'
+	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
 	if "`showmodels'"=="" local quietly quietly
+	if "`print'"=="" local print bscov
 	
 	// Interaction effects (contrasts)
 	preserve
-		qui xi, prefix(_J) : mvmeta_make `command' if `touse', `cmdopts' ///
-			usevars(`usetrtvar' `useintvars') /*names(_yInt _SInt)*/ by(`study') ppfix(check) `hard' `collapse_opt' nodetails clear
-		local yvars : colnames e(b)
-		
-		disp `"`yvars'"'
-		
-		nois disp as text _n "Test of interaction(s):"
-		local vlist
-		foreach v of local useintvars {
-			local vlist `vlist' y`v'
+		qui mvmeta_make `cmdname' `depvar' `trtvar' `intvars' `covars' `adjvars' if `touse', `cmdopts' ///
+			usevars(`trtvar' `intvars') by(`study') ppfix(check) `hard' `collapse_opt' nodetails clear
+		// local yvars : colnames e(b)
+
+		// list y_* S_*, abbrev(20)
+		foreach s of varlist S_* {
+			qui replace `s' = `augvariance' if `s'>=`augvariance'		// REVISIT (or at least tell user what is happening and why)
 		}
-		`quietly' mvmeta y S, vars(`vlist') fixed
-		nois test `vlist'
+		
+		** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
+		nois disp as text _n "Test of interaction(s):"		
+		`quietly' mvmeta y S, vars(`useJyvars') print(`print') `sigmagamma' `soptions' `eformopt'
+		nois test `useJyvars'
 		local chi2_int = r(chi2)
 		local df_int = r(df)
 		local p_int = r(p)
 
-		tempname GammaHat VarGammaHat		
+		tempname GammaHat VarGammaHat SigmaGamma Chol
 		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
 		matrix define `GammaHat'    = e(b)[1,       1..`k1']
+		matrix define `SigmaGamma'  = e(Sigma)
+		
+		// extract cholesky matrix of Sigma
+		if `"`structure'"'=="unstructured" {
+			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
+			// so don't bother packing them up into a matrix; we're only going to unpack them again later		
+			matrix define `Chol' = e(b)[1, `k'...]
+		}
+		else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
+			local tau = e(b)[1, `k']
+			cholesky2 `SigmaGamma' `Chol'
+			matrix define `Chol' = sign(`tau') * `Chol'
+		}
+		else if `"`structure'"'=="randombeta" {
+			matrix define `Chol' = J(`k1', `k1', 0)
+		}
+		
+		local rownames_eb : rownames e(b)
+		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''	// REVISIT
+		matrix coleq `GammaHat' = :
+		matrix coleq `VarGammaHat' = :
+		matrix roweq `VarGammaHat' = :
 
 		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 			
-			tokenize useintvars
-			if `"`sepgroups'"'==`""' {
-				qui levelsof `intvars', local(levs)		// `intvars' is the (single) original factor variable
-				rename y_`usetrtvar' _y_ES`ref'
-				qui gen double _y_seES`ref' = sqrt(S_`usetrtvar'_`usetrtvar')
+			tokenize intvars
+			if `"`sepgroups'"'!=`""' {
+				qui levelsof `facvar', local(levs)
+				rename y_`trtvar' _y_ES`ref'
+				qui gen double _y_seES`ref' = sqrt(S_`trtvar'_`trtvar')
 				
 				foreach i of local levs {
 					if `i'!=`ref' {
 						qui gen double _y_ES`i' = _y_ES`ref' + y_``i''
-						qui gen double _y_seES`i' = sqrt(S_`usetrtvar'_`usetrtvar' + S_``i''_``i'' + 2*S_`usetrtvar'_``i'')
+						qui gen double _y_seES`i' = sqrt(S_`trtvar'_`trtvar' + S_``i''_``i'' + 2*S_`trtvar'_``i'')
 					}
 				}
 				local extra _y_ES* _y_seES*
@@ -541,19 +295,24 @@ program define ipdfloat, eclass
 
 	restore
 	
+	
+	** STEP 2: ESTIMATE TREATMENT EFFECT IN REF GROUP (MEAN, BS VARIANCE AND BS CORRELATION WITH INTERACTIONS)
+	// subtract within-trial interactions from observed interaction data
+	// set up equations that make shifted interactions have mean zero
+	
 	// Treatment effect at reference value (if continuous), or in reference subgroup (if factor)
 	tempvar offset offset_h
 	qui gen double `offset_h' = .
 	qui gen double `offset' = 0
 
-	tokenize `useintvars'
+	tokenize `intvars'
 	forvalues i = 1 / `k1' {
 		qui replace `offset' = `offset' + `GammaHat'[1, `i']*``i''
 	}
 
 	// setup offset
 	unabcmd `cmdname'
-	if inlist(`"`r(cmd)'"', "regress", "mixed") {
+	if inlist(`"`r(cmd)'"', "regress", "xtreg", "mixed") {		// commands with continuous outcomes, from which offset can be directly subtracted
 		tempvar depvar_offset
 		qui gen double `depvar_offset' = `depvar' - `offset'
 		local depvar2 : copy local depvar_offset
@@ -563,24 +322,13 @@ program define ipdfloat, eclass
 		local depvar2 : copy local depvar
 	}
 
-	// NOTE: commands allowing offset() option:
-	// binreg, biprobit, clogit, cloglog, cpoisson, expoisson, fracreg, glm, heckman, heckoprobit, heckpoisson, heckprobit, hetoprobit, hetprobit,
-	// intreg, ivpoisson, logistic, logit, nbreg, gnbreg, ologit, oprobit, poisson, probit, scobit, tnbreg, tobit, tpoisson, truncreg, zinb, ziologit, zioprobit, zip
-	
-	// for now, just assume everything except -regress-, -xtreg- and -mixed-
-	
-	if `"`sepgroups'"'==`""' | `"`factor'"'==`""' {
-		
-		// Note:
-		// `command' should be the same as:
-		// `cmdname' `depvar' `usetrtvar' `useintvars' `covars' `other'
-
-		// remove `useintvars' from `command':
-		local command_new `cmdname' `depvar2' `usetrtvar' `covars' `other'
-		local usevars `usetrtvar'
+	if `"`facvar'"'==`""' | `"`sepgroups'"'!=`""' {			// non-factor (i.e. continuous); or factor without by-subgroup covariance structure
+		// remove `intvars' from `command':
+		local command_new `cmdname' `depvar2' `trtvar' `covars' `adjvars'
+		local usevars `trtvar'
 		
 		/*
-		if `"`factor'"'==`""' {
+		if `"`facvar'"'==`""' {
 			rename _STUDY Trial
 			keep Trial _ES _seES
 			tempfile subgroups
@@ -590,25 +338,46 @@ program define ipdfloat, eclass
 	}
 		
 	else {
-		// replace `usetrtvar' with new variable `refintvar'
+		// replace `trtvar' with new variable `refintvar'
 		tempvar refintvar
-		qui gen byte `refintvar' = `usetrtvar' * (`intvars'==`ref')		// `intvars' is the (single) original factor variable
+		qui gen byte `refintvar' = `trtvar' * (`facvar'==`ref')		// `facvar' is the original factor variable
+		local command_new `cmdname' `depvar2' `refintvar' `intvars' `covars' `adjvars'
+		local usevars `refintvar' `intvars'
+	}
+	
+	// set up constraints on the BS variance of the interactions
+	// using the Cholesky matrix from STEP 1
+	if `"`structure'"'!="fixed" & `"`naive'"'==`""' {
+		SetupConstraints `Chol' `propU', k(`k') structure(`structure') `forcetrend'
+		local constr_list `s(constr_list)'
 		
-		local command_new `cmdname' `depvar2' `refintvar' `useintvars' `covars' `other'
-		local usevars `refintvar' `useintvars'
+		if `"`constr_list'"'!=`""' {
+			if `"`listconstraints'"'!=`""' {
+				nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
+				nois constraint dir `constr_list'
+			}
+			local constr_opt constraints(`constr_list')
+		}
 	}
 	
 	preserve
-		qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-		mvmeta y S, fixed commonparm
+		qui mvmeta_make `command_new' if `touse', `offset_opt' `cmdopts' usevars(`usevars') by(`study') ppfix(check) `hard' clear
+		
+		// list y_* S_*, abbrev(20)
+		foreach s of varlist S_* {
+			qui replace `s' = `augvariance' if `s'>=`augvariance'		// REVISIT
+		}
+		
+		`quietly' mvmeta y S, print(`print') commonparm `constr_opt' `sigmabeta' `soptions'
 
-		tempname ThetaHat VarThetaHat
+		tempname ThetaHat VarThetaHat SigmaBeta
 		matrix define `VarThetaHat' = e(V)[1,1]
 		matrix define `ThetaHat'    = e(b)[1,1]
+		matrix define `SigmaBeta'   = e(Sigma)			// CHECK -- does this need L applying to it? [don't think so, as the parameterisation is already correct?]
 		
 		if "`saving'"!="" | "`clear'"!="" {
 			keep Trial _y* _S*
-			qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)					
+			qui reshape long _y_ES _y_seES _yInt_ES _yInt_seES, i(Trial) j(Subgroup)				
 			tempfile subgroups
 			qui save `subgroups'
 		}		
@@ -637,8 +406,13 @@ program define ipdfloat, eclass
 		}
 
 		preserve
-			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-			qui mvmeta y S, fixed commonparm
+			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') by(`study') ppfix(check) `hard' clear
+			
+			foreach s of varlist S_* {
+				qui replace `s' = `augvariance' if `s'>=`augvariance'		// REVISIT -- see above
+			}
+		
+			qui mvmeta y S, commonparm `constr_opt' `sigmabeta' `soptions'	// REVISIT -- do constraints still work with updated offset??
 			scalar `eff_pos' = e(b)[1,1]
 		restore
 		
@@ -650,13 +424,18 @@ program define ipdfloat, eclass
 		// update offset
 		qui replace `offset_h' = `offset' - `h'*``i''
 		unabcmd `cmdname'
-		if inlist(`"`r(cmd)'"', "regress", "mixed") {
+		if inlist(`"`r(cmd)'"', "regress", "xtreg", "mixed") {
 			qui replace `depvar_offset' = `depvar' - `offset_h'
 		}
 		
 		preserve
-			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') /*names(_y _S)*/ by(`study') ppfix(check) `hard' clear
-			qui mvmeta y S, fixed commonparm
+			qui mvmeta_make `command_new' if `touse', `offset_opts' `cmdopts' usevars(`usevars') by(`study') ppfix(check) `hard' clear
+			
+			foreach s of varlist S_* {
+				qui replace `s' = `augvariance' if `s'>=`augvariance'		// REVISIT -- see above
+			}
+		
+			qui mvmeta y S, commonparm `constr_opt' `sigmabeta' `soptions'	// REVISIT -- do constraints still work with updated offset??
 			scalar `eff_neg' = e(b)[1,1]
 		restore
 
@@ -665,7 +444,7 @@ program define ipdfloat, eclass
 		
 
 	*** Assemble matrices
-	if "`factor'"!="" {
+	if "`facvar'"!="" {
 		tempname ones Z A BetaHat VarBetaHat
 		
 		matrix define `ones' = J(`k', 1, 1)
@@ -684,20 +463,20 @@ program define ipdfloat, eclass
 		cap drop _Int_lci
 		cap drop _Int_uci
 		
-		qui gen double _Int_xb = `ThetaHat'[1,1]*`usetrtvar'
+		qui gen double _Int_xb = `ThetaHat'[1,1]*`trtvar'
 		qui gen double _Int_stdp = .
-		tokenize `useintvars'
+		tokenize `intvars'
 		forvalues i = 1 / `k1' {
 			qui replace _Int_xb = _Int_xb + `GammaHat'[1, `i']*``i''
 		}
 		
-		mata: st_view(X=., ., "`usetrtvar'", "`touse'")
-		mata: st_view(Z=., ., "`useintvars'", "`touse'")
+		mata: st_view(X=., ., "`trtvar'", "`touse'")
+		mata: st_view(Z=., ., "`intvars'", "`touse'")
 		mata: VarThetaHat = st_matrix("`VarThetaHat'")
 		mata: VarGammaHat = st_matrix("`VarGammaHat'")
-		mata: GradZ = st_matrix("`Grad'")
-		mata: GradZ = Z + J(rows(Z), 1, 1) * GradZ
-		mata: Var_Xb = diag(VarThetaHat*X) + GradZ*VarGammaHat*GradZ'
+		mata: A = st_matrix("`Grad'")
+		mata: A = J(rows(Z), 1, 1)*A + Z
+		mata: Var_Xb = diag(VarThetaHat*X) + A*VarGammaHat*A'
 		mata: st_store(st_viewobs(X), "_Int_stdp", sqrt(diagonal(Var_Xb)))
 
 		qui gen double _Int_lci = _Int_xb - invnormal(.5 + `level'/200)*_Int_stdp
@@ -816,29 +595,39 @@ program define ipdfloat, eclass
 
 	
 	*** Finally, present the results
-	if "`factor'"!="" {
-		// mat list `BetaHat'
-		// mat list `VarBetaHat'
+	if "`facvar'"!="" {
 		mat `BetaHat' = `BetaHat''
-		
+		matrix coleq `BetaHat' = :
+		matname `BetaHat'    `Iyvars', columns(.) explicit
+		matname `VarBetaHat' `Iyvars', explicit
 		ereturn post `BetaHat' `VarBetaHat', depname(Subgroup)
-		// ereturn matrix GammaHat    = `GammaHat'
-		// ereturn matrix VarGammaHat = `VarGammaHat'
-		// ereturn matrix ThetaHat    = `ThetaHat'
-		// ereturn matrix VarThetaHat = `VarThetaHat'
+
 		ereturn matrix GammaHat    = `GammaHat'
 		ereturn matrix VarGammaHat = `VarGammaHat'
+		ereturn matrix SigmaGamma  = `SigmaGamma'
+		ereturn matrix SigmaBeta   = `SigmaBeta'
+
+		ereturn matrix Grad        = `Grad'
 		ereturn scalar ThetaHat    = `ThetaHat'[1,1]
 		ereturn scalar VarThetaHat = `VarThetaHat'[1,1]
-		ereturn matrix Grad        = `Grad'
-		// ereturn matrix A = `A'
-		// ereturn matrix SigmaGamma  = `SigmaGamma'
-		// ereturn matrix SigmaBeta   = `SigmaBeta'
-		// ereturn scalar n = `t'						// number of studies
-		ereturn scalar k = `k'						// number of subgroups
+		// ereturn scalar n = `n'		// number of studies
+		ereturn scalar k = `k'		// number of subgroups
+
+		ereturn scalar chi2_int = `chi2_int'
+		ereturn scalar df_int = `df_int'
+		ereturn scalar p_int = `p_int'
+		
+		// ereturn local bscov_Gamma `"`sigmagamma'"' 
+		// ereturn local bscov_Beta `"`sigmabeta'"' 
 		
 		nois disp as text _n "Floating subgroups:"
 		ereturn display, `eformopt'
+
+		/*
+		if `"`constr_list'"'!=`""' & `"`structure'"'!=`"user"' {	// only drop internally-defined constraints
+			constraint drop `constr_list'
+		}
+		*/
 	}
 	
 	ereturn local command     `"`command'"'
@@ -853,9 +642,645 @@ end
 
 
 
+program define ProcessTerms, sclass
+
+	syntax anything [if] [in], [TRTVAR(varname numeric) INTVARs(varlist numeric) CHECK]
+	marksample touse
+	
+	// Assume first element of `command' is of the form: i.`trtvar'*`i'`intvar'
+	if `"`trtvar'"'==`""' {
+		tokenize `"`anything'"', parse(" .*")
+		unab trtvar : `3', max(1)
+		capture {
+			assert `"`1'`2'"'==`"i."'
+			assert `"`4'"'==`"*"'
+		}
+		if _rc {
+			nois disp as err  "Could not identify treatment variable. If option {bf:trtvar()} is not specified,"
+			nois disp as err `" then first element of {it:command} should be of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
+			exit 198
+		}
+	}
+	cap tab `trtvar' if `touse'
+	if _rc {
+		tab `trtvar' if `touse'
+	}
+	cap assert `r(r)'==2
+	if _rc {
+		nois disp as err "Treatment variable {bf:`trtvar'} must take exactly two values"
+		exit _rc
+	}
+	
+	// find reference value for treatment variable
+	local trtref : char `trtvar'[omit]
+	if `"`trtref'"'==`""' {
+		summ `trtvar', meanonly
+		local trtref = r(min)
+	}
+	else {
+		confirm integer number `trtref'
+		qui count if `trtvar'==`trtref'
+		if !`r(N)' {
+			summ `trtvar', meanonly
+			nois disp `"{error}Reference value `trtref' is not taken on by variable {bf:`trtvar'} in any observations currently in memory"'
+			nois disp `"{error}Reference value will be re-set to `r(min)'"'
+			local trtref = r(min)
+		}
+	}	
+	
+	// Now search `anything' for terms beginning "i.trt* ... "
+	local specintvars : copy local intvars
+	local remain : copy local intvars
+	gettoken el rest : anything
+	local k = 1						// for treatment
+	while `"`el'"'!=`""' {
+		tokenize `"`el'"', parse(".*|")
+		
+		if lower(`"`1'`2'"')==`"i."' {
+			unab newvar : `3'
+			local facvars `facvars' `el'
+			if `"`factor'"'!=`""' {
+				gettoken el rest : rest
+				continue
+			}
+		
+			if inlist(`"`4'"', `"*"', `"|"') & `"`newvar'"'==`"`trtvar'"' {
+				
+				// factor
+				if lower(`"`5'`6'"')==`"i."' {
+					unab newvar : `7'
+					if (`: list newvar in intvars') & (`: word count `intvars'' > 1) {
+						nois disp as err `"If option {bf:intvars()} is specified, and contains a factor variable, then no other variables may be specified to this option"'
+						exit 198
+					}
+					if `"`intvars'"'==`""' | `"`newvar'"'==`"`intvars'"' {
+						local remain : list remain - newvar
+						local intvars : copy local newvar
+						local factor factor
+						gettoken el rest : rest
+						continue
+					}
+				}
+				
+				// continuous
+				else {
+					unab newvar : `5'
+					if `"`intvars'"'==`""' | `: list newvar in intvars' {
+						local remain : list remain - newvar
+						local covars `covars' `newvar'
+						local ++k
+					}
+				}
+			}
+		}
+		else local adjvars `adjvars' `el'
+		gettoken el rest : rest
+	}
+	
+	if `"`remain'"'!=`""' {
+		nois disp as err `"Failed to identify interaction(s) between treatment variable {bf:`trtvar'} and covariate(s) {bf:`remain'}"'
+		nois disp as err `"Please check {it:command} and {bf:intvars()} option, and try again"'
+		exit 198
+	}
+	
+	if `"`factor'"'!=`""' {				// factor-variable; recall that `intvars' must contain only a single varname
+		cap tab `intvars' if `touse'
+		if _rc {
+			tab `intvars' if `touse'
+		}
+		local k = r(r)		// can overwrite previously-defined local k
+		if `k'>10 {
+			nois disp as err `"Too many factor levels in variable {bf:`intvars'} (max of 10)"'
+			exit 198
+		}
+				
+		// find reference value
+		local ref : char `intvars'[omit]
+		if `"`ref'"'==`""' {
+			summ `intvars', meanonly
+			local ref = r(min)
+		}
+		else {
+			confirm integer number `ref'
+			qui count if `intvars'==`ref'
+			if !`r(N)' {
+				summ `intvars', meanonly
+				nois disp `"{error}Reference value `ref' is not taken on by variable {bf:`intvars'} in any observations currently in memory"'
+				nois disp `"{error}Reference value will be re-set to `r(min)'"'
+				local ref = r(min)
+			}
+		}
+	}
+	
+	else {		// continuous
+		if `"`intvars'"'!=`""' {
+			local problem : list intvars - covars
+			if `"`problem'"'!=`""' {
+				local p1 : word 1 of `problem'
+				nois disp as err `"Could not find term {bf:i.`trtvar'*`p1'} in {it:command}"'
+				exit 198
+			}
+		}
+		else {
+			local intvars : copy local covars	// use all of the identified `covars'
+		}
+		
+		// find reference value
+		local intvar1 : word 1 of `intvars'
+		local ref : char `intvar1'[omit]
+		if `"`ref'"'==`""' {
+			summ `intvar1', meanonly
+			local ref = r(mean)
+		}
+		else {
+			confirm number `ref'
+			summ `intvar1', meanonly
+			if !inrange(`ref', `r(min)', `r(max)') {
+				summ `intvar1', meanonly
+				nois disp `"{error}Reference value `ref' does not lie within the range of variable {bf:`intvar1'} among the observations currently in memory"'
+				nois disp `"{error}Reference value will be re-set to `r(mean)'"'
+				local ref = r(mean)
+			}
+		}
+		
+		// options not allowed with continuous interactions
+		if `"`saving'"'!=`""' {
+			nois disp as err "Cannot use option {bf:saving()} with continuous interactions"
+			exit 198
+		}
+		if `"`clear'"'!=`""' {
+			nois disp as err "Cannot use option {bf:clear} with continuous interactions"
+			exit 198
+		}	
+		if `"`sepgroups'"'!=`""' {
+			nois disp as err "Cannot use option {bf:sepgroups} with continuous interactions"
+			exit 198
+		}
+	}
+	local k1 = `k' - 1
+	
+	// Now run -xi- on the supplied command
+	// and use the results to check again for consistency and for correct variables to use
+	qui xi, prefix(_J) `anything'
+	local OldVarsPrefix : char _dta[__xi__Vars__Prefix__]
+	local OldVarsToDrop: char _dta[__xi__Vars__To__Drop__]
+	local i = 0
+	foreach el of local OldVarsPrefix {
+		local ++i
+		if `"`el'"'==`"_J"' {
+			local eli : word `i' of `OldVarsToDrop'
+			local VarsToDrop `VarsToDrop' `eli'
+			
+			local intvarlab : variable label `eli'
+			tokenize `"`intvarlab'"', parse("*&")
+			args trtpart symbol intpart rest
+			
+			// parse first part (treatment)
+			local open
+			local close
+			tokenize `"`trtpart'"', parse("(=)")
+			if `"`1'"'!=`"("' {
+				cap {
+					assert `"`factor'"'!=`""' | `"`symbol'"'==`""'
+					assert `"`2'"'==`"=="'
+					assert `"`4'"'==`""'
+				}
+				args trtname eq trtval					// format:  trtname==trtval [& intname==intval]
+			}
+			else {
+				cap {
+					assert `"`1'`3'`5'"'==`"(==)"'
+					assert `"`6'"'==`""'
+				}
+				args open trtname eq trtval close		// format:  (trtname==trtval)*intname
+			}
+			if _rc ExitErr
+			
+			// parse second part (interaction)
+			tokenize `"`intpart'"', parse("=")
+			args intname eq intval
+			cap {
+				assert `"`rest'"'==`""'
+				assert inlist(`"`symbol'"', `""', `"*"', `"&"')
+				assert `"`symbol'"'==`""' if `"`intname'"'==`""'
+				assert `"`symbol'"'==`"*"' & `"`intname'"'!=`""' & `"`eq'"'==`""' if `"`open'"'!=`""'
+				assert `"`intval'"'!=`""' & `"`eq'"'==`"=="' if `"`open'"'==`""' & `"`symbol'"'==`"&"'
+				assert `"`4'"'==`""'
+			}
+			if _rc ExitErr
+
+			if `"`trtname'"'==`"`trtvar'"' {
+				cap assert `trtval' != `trtref'
+				if _rc ExitErr
+
+				// if treatment variable alone (i.e. *not* interaction), then continue to process next element
+				if `"`symbol'"'==`""' {
+					local usetrtvar : copy local eli
+					continue
+				}
+
+				// if a treatment-covariate interaction, check whether `intname' was specified by intvars()
+				// if so:			
+				if (`"`specintvars'"'==`""' | `: list intname in specintvars') {
+					if `"`factor'"'!=`""' {
+						// if we have a factor-variable interaction defined, cannot have any futher interactions with treatment
+						if `"`specintvars'"'==`""' {
+							if `"`open'"'!=`""' {
+								nois disp as err "Cannot interact treatment with both a factor and a continuous variable"
+								exit 198
+							}
+							if `"`intname'"'!=`"`intvars'"' {
+								nois disp as err "Cannot interact treatment with more than one factor variable"
+								exit 198
+							}
+						}
+						cap {
+							assert `"`eq'"'==`"=="'
+							assert `intval' != `ref'
+						}
+					}
+					else {
+						cap confirm variable `intpart'
+						local intname : copy local intpart
+					}
+					if _rc ExitErr
+					
+					local useintvars `useintvars' `eli'
+					local intnames `intnames' `intname'
+					continue
+				}
+			}
+				
+			// otherwise, must be one of:
+			//  - a main effect of a factor-variable covariate;
+			//  - a treatment-covariate interaction not specified by intvars(), so not relevant to the procedure;
+			//  - a non-treatment interaction, which is being adjusted-for but is not relevant to the procedure.
+			cap assert `"`intname'"'!=`"`trtvar'"'
+			if _rc {
+				nois disp as err "Cannot specify an interaction term where the treatment variable is in second position"
+				exit 198
+			}
+			if `"`trtname'"'==`"`intvars'"' {
+				cap assert `"`symbol'"'==`"&"' 
+				cap assert `trtval'!=`ref'
+				if _rc ExitErr
+			}
+			
+			// if interaction with continuous covariate, need to save main-effect of this covariate as well as the interaction
+			if `"`intpart'"'==`""' local covars `covars' `eli'
+			else {
+				if `"`symbol'"'==`"*"' local adjfacvars `adjfacvars' `intname'
+				local adjfacvars `adjfacvars' `eli'
+			}
+		}	
+	}
+
+	cap {
+		confirm variable `trtvar'
+		confirm variable `intvars'
+		confirm numeric variable `usetrtvar'
+		confirm numeric variable `useintvars'
+		assert `: word count `useintvars'' == `k1'
+		assert `: word count `covars'' == `k1'
+		
+		if `"`factor'"'==`""' {
+			assert `: list intvars === intnames'		// this is trivial; remove??
+			assert `: word count `intvars''==`: word count `useintvars''
+		}
+	}
+	if _rc ExitErr
+
+	local adjfacvars : list uniq adjfacvars
+	
+	sreturn local trtvar `usetrtvar'
+	sreturn local intvars `useintvars'
+	if `"`factor'"'!=`""' {
+		sreturn local facvar `intvars'
+	}
+	sreturn local covars `covars'
+	sreturn local adjvars `adjfacvars' `adjvars'
+	sreturn local ref `ref'
+
+	
+	** TEMP -- extra check
+	* Fit original command and new command, and compare statistics to check they are the same model
+	if `"`check'"'==`""' exit
+
+	disp `"trtvar: `trtvar'"'
+	disp `"intvars: `intvars'"'
+	disp `"facvars: `facvars'"'
+	disp `"adjvars: `adjvars'"'
+	disp `"adjfacvars: `adjfacvars'"'
+	disp `"covars: `covars'"'						// main effects of interacted covars
+	disp `"usevars: `usetrtvar' `useintvars'"'	
+	disp `"k = `k'"'
+	
+	disp _n `"-----------"'
+	
+	disp trim(itrim(`"`command'"'))
+	disp trim(itrim(`"`cmdname' `depvar' `facvars' `adjvars'"'))
+	local cmd2 `"`cmdname' `depvar' `facvars' `adjvars'"'
+	assert `: list command === cmd2'
+	disp `"`cmdname' `depvar' `usetrtvar' `useintvars' `covars' `adjfacvars' `adjvars'"'
+	
+	qui `cmdname' `depvar' `usetrtvar' `useintvars' `covars' `adjfacvars' `adjvars'
+	local eN_2 = e(N)
+	local eN_fail_2 = e(N_fail)
+	local ell_0_2 = e(ll_0)
+	local ell_2 = e(ll)
+
+	_ms_omit_info e(b)
+	mat omit_info_2 = r(omit)
+	local yvars2 : colnames e(b)
+	local c : word count `yvars2'
+	forvalues i=1/`c' {
+		local omit = omit_info_2[1, `i']
+		if !`omit' {
+			local newyvars2 `newyvars2' `: word `i' of `yvars2''
+		}
+	}
+
+	qui xi, prefix(_J): `command'
+	local eN_1 = e(N)
+	local eN_fail_1 = e(N_fail)
+	local ell_0_1 = e(ll_0)
+	local ell_1 = e(ll)
+
+	_ms_omit_info e(b)
+	mat omit_info_1 = r(omit)
+	local yvars1 : colnames e(b)
+	local c : word count `yvars1'
+	forvalues i=1/`c' {
+		local omit = omit_info_1[1, `i']
+		if !`omit' {
+			local newyvars1 `newyvars1' `: word `i' of `yvars1''
+		}
+	}
+
+	disp `"`newyvars1' == `newyvars2'"'
+	assert `: list newyvars1 === newyvars2'
+	disp `"`eN_1' == `eN_2'"'
+	assert `eN_1'==`eN_2'
+	disp `"`eN_fail_1' == `eN_fail_2'"'
+	assert `eN_fail_1'==`eN_fail_2'
+	disp `"`ell_0_1' == `ell_0_2'"'
+	assert float(`ell_0_1')==float(`ell_0_2')
+	disp `"`ell_1' == `ell_2'"'
+	assert float(`ell_1')==float(`ell_2')
+
+end
+
+	
+	
+// process covariance structures
+// [ subroutine taken directly from -metafloat- ]
+program define CovStruct, sclass
+	syntax anything, k(integer) trans(name) [ /*facvar(passthru) sepgroups*/ BSCOVariance(string) naive ///
+		fixed UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 * ]
+	
+	local soptions : copy local options
+	if `"`wsc0'"'!=`""' local wscorrzero wscorrzero
+	opts_exclusive `"`fixed' `unstructured' `exchangeable' `randombeta' `wscorrzero'"' `""' 184
+	local structure `fixed'`unstructured'`exchangeable'`randombeta'`wscorrzero'
+
+	if `"`structure'"'!=`""' {
+		if `"`bscovariance'"'!=`""' {
+			nois disp as err `"Cannot specify both {bf:`structure'} and {bf:bscovariance()}"'
+			exit 198
+		}
+	}
+	else {
+		local 0 `bscovariance'
+		syntax [ , FIXED UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 ]
+		if `"`wsc0'"'!=`""' local wscorrzero wscorrzero
+		opts_exclusive `"`fixed' `unstructured' `exchangeable' `randombeta' `wscorrzero'"' `""' 184
+		local structure `fixed'`unstructured'`exchangeable'`randombeta'`wscorrzero'
+	}
+	
+	// parse pre-defined tempname matrices
+	tokenize `anything'
+	args sgmat propU
+	local T : copy local trans
+	
+	if `"`structure'"'=="fixed" {
+		local sigmagamma fixed
+		local sigmabeta fixed
+	}
+	else if `"`structure'"'=="randombeta" {
+		local sigmagamma fixed
+		matrix define `propU' = J(`k', `k', 0)
+		matrix define `propU'[`k', `k'] = 1
+		matrix define `propU' = `T''*`propU'*`T'
+		local sigmabeta bscov(proportional `propU')
+	}		
+	else {
+		local sigmagamma bscov(unstructured)
+		local sigmabeta bscov(unstructured)
+
+		if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
+			local sigmagamma bscov(exchangeable .5)
+			
+			/*
+			if `"`sepgroups'"'!=`""' {	// revisit whether == or !=
+				local sigmabeta bscov(exchangeable)			// using "NEW" mvmeta version 3.5.1 # Ian White # 21dec2021 -- REVISIT!!
+			}
+			*/
+			
+			if `"`structure'"'=="wscorrzero" {
+				local sigmabeta bscov(equals `propU')	// matrix yet to be defined -- depends on SigmaGamma
+				// local sigmabeta bscov(exchangeable 0)		// "naive" form: proportional to identity, zero covariances
+			}
+		}
+		else if `"`structure'"'==`""' {
+			sreturn local default default
+			local structure unstructured
+		}
+	}
+
+	if `"`naive'"'!=`""' & `"`structure'"'!=`"unstructured"' {
+		nois disp as err `"Option {bf:naive} is only valid with {bf:unstructured} covariance structure"'
+		exit 198
+	}
+	
+	sreturn local structure    `structure'
+	sreturn local sigmagamma `"`sigmagamma'"'
+	sreturn local sigmabeta  `"`sigmabeta'"'
+	sreturn local naive      `"`naive'"'	
+	sreturn local options    `"`soptions'"'	
+
+end
+
+
+// Generate transformation matrix based on choice of reference subgroup
+// ...and set up trend if appropriate
+// [ subroutine taken directly from -metafloat- ]
+program define TransMatrix, sclass
+
+	syntax namelist, subgroup(varname) [ noTRend * ]
+	tokenize `namelist'
+	args T d
+	
+	qui tab `subgroup'
+	local k = r(r)
+	local k1 = `k' - 1
+	cap confirm string variable `subgroup'
+	if !_rc local string string
+	qui levelsof `subgroup', local(sglist)		
+
+	if `"`: char `subgroup'[omit]'"'==`""' {
+		local r = 1
+		gettoken ref sgnoref : sglist
+		matrix define `T' = I(`k')
+	}
+	else {
+		local ref : char `subgroup'[omit]
+		local r : list posof `"`ref'"' in sglist
+		cap assert `r' > 0
+		if _rc {
+			nois disp as err `"Reference value `ref' not taken on by variable {bf:`subgroup'} within the analysis sample"'
+			exit 198
+		}
+		if `r'==1 matrix define `T' = I(`k')
+		else {
+			local kr = `k' - `r'
+			local kr1 = `kr' + 1
+			matrix define `T' = J(1, `k', 0)
+			matrix define `T'[1, `r'] = 1
+			if `r'==`k' {
+				matrix define `T' = `T' \ ( I(`k1'), J(`k1', 1, 0))
+			}
+			else {
+				tempname Id
+				matrix define `Id' = I(`k1')
+				matrix define `T' = `T' \ ( `Id'[1..`k1', 1..`kr'], J(`k1', 1, 0), `Id'[1..`k1', `kr1'..`k1'] )
+			}
+		}
+	}
+	if `"`string'"'!=`""' {
+		qui numlist "1(1)`k'"
+		local sglist `"`r(numlist)'"'
+		local ref : copy local r
+	}
+	
+	// Note:
+	// `sglist' is an **ordered** (according to -levelsof- ) list of subgroup identifiers
+	// `r' is the index w.r.t. `sglist'
+	// `ref' is the relevant element of `sglist' (e.g. for labelling the matrix stripe elements)
+	// (and, unless `string', `ref' will also be a numeric value, which may have a value label)
+	
+	* Setup test for trend
+	if `"`trend'"'==`""' {
+		forvalues i = 1 / `k' {
+			matrix define `d' = nullmat(`d') \ `i'	// linear trend (could in theory allow more general forms for `d')
+		}
+
+		// Convert `d' into a matrix of contrasts
+		// ... and apply transformation if reference is not first subgroup
+		tempname M
+		matrix define `M' = J(`k1', 1, -1), I(`k1')
+		matrix define `d' = `M' * `T' * `d'
+	}
+	
+	sreturn local sglist `"`sglist'"'
+	sreturn local k `"`k'"'
+	sreturn local ref  `"`ref'"'	
+	sreturn local options `"`options'"'
+	
+end
+
+
+program define cholesky2
+* produce an approximate cholesky decomposition, even if matrix is not positive definite
+* (Note: taken from -mvmeta- by Ian White)
+args M C
+cap matrix `C' = cholesky(`M')
+if _rc {
+    local eps = trace(`M')/1000
+    if `eps'<=0 {
+        di as error "cholesky2: matrix `M' has non-positive trace"
+        matrix list `M'
+        exit 498
+    }
+    local p = rowsof(`M')
+    cap matrix `C' = cholesky(`M'+`eps'*I(`p'))
+    if _rc {
+        di as error "cholesky2: can't decompose matrix `M'"
+        matrix list `M'
+        exit 498
+    }
+}
+end
+
+
+program define SetupConstraints, sclass
+
+	syntax namelist(min=2 max=2), k(integer) structure(string) [forcetrend]
+	tokenize `namelist'
+	args Chol propU
+	
+	local k1 = `k' - 1
+	if `"`structure'"'!="wscorrzero" {
+		local c = 0
+		forvalues i = 1 / `k1' {
+			forvalues j = 1 / `i' {
+				local ++c
+				
+				if `"`structure'"'=="unstructured" & `"`forcetrend'"'==`""' {
+					local el = `Chol'[1, `c']	// special case: see above
+				}
+				else local el = `Chol'[`i', `j']
+				
+				constraint free
+				constraint `r(free)' [chol`j'`i']_b[_cons] = `el'
+				local constr_list `constr_list' `r(free)'
+			}
+		}
+	}
+	
+	// if exchangeable, need to do a little more work
+	if `"`structure'"'=="exchangeable" {
+		local tau = `Chol'[1, 1]
+		tempname Chol_k
+		matrix define `Chol_k' = inv(`Chol') * J(`k1', 1, -.5*(`tau')^2)
+		forvalues j = 1 / `k1' {
+			constraint free
+			constraint `r(free)' [chol`j'`k']_b[_cons] = `=`Chol_k'[`j', 1]'
+			local constr_list `constr_list' `r(free)'
+		}
+	}
+	
+	// similarly if trend
+	else if `"`forcetrend'"'!=`""' {
+		forvalues j = 1 / `k1' {
+			constraint free
+			constraint `r(free)' [chol`j'`k']_b[_cons] = 0
+			local constr_list `constr_list' `r(free)'
+		}
+	}
+	
+	// finally, wscorrzero is a special case: SigmaBeta is completely defined by SigmaGamma
+	else if `"`structure'"'=="wscorrzero" {
+		local tau = `Chol'[1, 1]
+		
+		tempname LinvT		// = Linv * Linv-transpose, where `L' is as defined in the main routine
+		matrix define `LinvT' = I(`k') + J(`k', `k', 1)
+		matrix define `LinvT'[1, `k'] = J(`k1', 1, -1) 
+		matrix define `LinvT'[`k', 1] = J(1, `k1', -1) 
+		matrix define `LinvT'[`k', `k'] = 1
+
+		matrix define `propU' = ((`tau')^2)*`LinvT'
+	}
+	
+	// constraint 4 y_Isubgroup_2=0
+	// constraint 5 y_Isubgroup_3=0
+
+	sreturn local constr_list `"`constr_list'"'
+	
+end
+
+
 program define ExitErr 
 	nois disp as err  "Failed to identify interaction variables"
 	nois disp as err `"{it:command} should contain at least one term of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
 	exit 198
 end
-
