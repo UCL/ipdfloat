@@ -21,10 +21,19 @@
 // Checks version of -metan- (requires version 4.05  David Fisher  29nov2021;  N.B. no longer uses -ipdmetan- )
 // Many functionalities from -metafloat- v0.9 copied across, e.g. random-effects, saved dataset
 
-*! v0.5  David Fisher 03feb2022
+* v0.5  David Fisher 03feb2022
 // Various improvements, bug fixes, and tying up of loose ends
 // Code for saved dataset moved to new subroutine "SavingClear"
 //  - still to do: "design", "trend"
+
+* v0.6  David Fisher 20mar2022
+// Added -asfactor- and -asfactor(matname)- options
+// to allow "continuous" covariates to be evaluated at a specific set of values
+// rather than at the entire observed continuous spectrum
+// This is useful e.g. for entering indicator variables with imputed (non-integer) values
+
+*! v0.6.1  David Fisher 05oct2022
+// A single subtle but important bug fix, affecting factor variables with saving|clear
 
 
 * Syntax:
@@ -70,8 +79,9 @@ program define ipdfloat, eclass
 	local command `"`s(after)'"'
 	
 	syntax, STUDY(varname) ///
-		[ TRTVAR(passthru) INTVARs(passthru) ///
+		[ TRTVAR(passthru) INTVARs(passthru) ASFactor(name) ASFactor2 ///
 		  SHOWmodels HARD noSEPGroups AUGVARiance(real 1e5) EPS(real 1e-7) FORWards BACKWards Level(cilevel) SAVING(string) CLEAR ///
+		  check /* undocumented; for debugging */ ///
 		  PRINT(string) * ]		// -mvmeta- options
 
 	_get_eformopts, eformopts(`options') allowed(__all__) soptions
@@ -97,8 +107,8 @@ program define ipdfloat, eclass
 	// and then finally run -xi- on the entire `command'
 	// use the results to identify correct variables to use later, with -mvmeta-
 	// Note: all variables must be numeric
-	ProcessTerms `rest' if `touse', `trtvar' `intvars' `options' cmdname(`cmdname')
-	if `"`checkexit'"'!=`""' exit	// for debugging
+	ProcessTerms `rest' if `touse', `trtvar' `intvars' `check' cmdname(`cmdname')
+	if `"`check'"'!=`""' exit		// for debugging
 	
 	local trtvar  `s(trtvar)'		// xi, prefix(_J) i.trtvar
 	local intvars `s(intvars)'		// xi, prefix(_J) i.trtvar*[i.]intvar1 [i.trtvar*intvar2 ... ]  = _J[trt]X[int]_1_`i' if factor;  else = _J[trt]X[int]_1
@@ -115,26 +125,92 @@ program define ipdfloat, eclass
 	// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
 	// also define trend vector `d' if appropriate [NOT IMPLEMENTED YET IN -ipdfloat-]
 	// [ subroutine taken directly from -metafloat- ]
-	tempname T d
+	tempname Z T d
+	matrix define `Z' = J(`k', `k1', 0)
+	matrix define `Z'[2, 1] = I(`k1')		// default; may be overwritten
+	
 	if `"`facvar'"'!=`""' {
+		if `"`asfactor'`asfactor2'"'!=`""' {
+			nois disp as err `"Option {bf:asfactor} can only be used with continuous interactions"'
+			exit 198
+		}
+
 		TransMatrix `T' `d', subgroup(`facvar') `soptions'
 		local soptions `"`s(options)'"'
 		assert `k'==`s(k)'
 		assert `ref'==`s(ref)'
 
 		qui levelsof `facvar', local(sglist)
-		local sgvarlab : variable label `facvar'
+		local sgvar : copy local facvar			// in case of saving/clear below
+	}
+	else {
+		// continuous covariate(s)
+		matrix define `T' = I(`k')
+		
+		if `"`asfactor'`asfactor2'"'!=`""' {
+			// DF 20th Mar 2022: 
+			// sglist, sgvarlab, sglab:  none of these actually exists, because there is no single `facvar' to extract them from
+			// therefore, set sglist to 0,1,2...
+			// and take sgvarlab and sglab from first element of `covars' (for want of anything better)
+			qui numlist `"0/`k1'"'
+			local sglist `"`r(numlist)'"'
+			local sgvar : word 1 of `covars'
+
+			local sgomit : char `sgvar'[omit]
+			if `"`sgomit'"'==`""' & float(`ref')!=0 {
+				nois disp `"{error}Option {bf:asfactor} specified; reference value will be set to 0"'
+			}
+			else if float(`ref')!=0 {
+				nois disp `"{error}Option {bf:asfactor} specified; reference value `ref' will be re-set to 0"'
+			}
+			local ref = 0
+			
+			/* TEMP PLACEMENT -- need to think about this some more */
+			// Needs to be done here, in case of saving/clear
+			if `"`asfactor'"'!=`""' {
+				cap {
+					confirm matrix `asfactor'
+					assert rowsof(`asfactor') == `k'
+					assert colsof(`asfactor') == `k1'
+				}
+				if _rc {
+					disp as err `"invalid matrix `asfactor' in option asfactor()"'
+					exit 198
+				}
+				matrix define `Z' = `asfactor'
+			}
+			local asfactor asfactor		// simplify	going forward
+		}
+
+		// options not allowed with continuous interactions
+		else {
+			if `"`saving'"'!=`""' {
+				nois disp as err `"Cannot use option {bf:saving()} with continuous interactions"'
+				exit 198
+			}
+			if `"`clear'"'!=`""' {
+				nois disp as err `"Cannot use option {bf:clear} with continuous interactions"'
+				exit 198
+			}
+			if `"`sepgroups'"'!=`""' {
+				nois disp as err `"Cannot use option {bf:sepgroups} with continuous interactions"'
+				exit 198
+			}
+		}
+	}
+	
+	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		local sgvarlab : variable label `sgvar'
 		local studylab : variable label `study'		// also save `study' variable label
 		
 		// save facvar value label
 		// unlike in "metafloat", we need to use "label save" because we will manipulate the data before saving
-		local sglab : value label `facvar'
+		local sglab : value label `sgvar'
 		if `"`sglab'"'!=`""' {
 			tempfile sglabfile
 			qui label save `sglab' using `sglabfile'
-		}
+		}	
 	}
-	else matrix define `T' = I(`k')
 	
 	// Setup covariance structures
 	// [ subroutine taken directly from -metafloat- ]
@@ -175,6 +251,8 @@ program define ipdfloat, eclass
 	
 		if `"`facvar'"'==`""' {		// continuous covariate
 			local useJyvars `useJyvars' y`intvari'
+			local Iyvar = subinstr(`"y`intvari'"', `"_J"', `"_I"', 1)
+			local Iyvars `Iyvars' `Iyvar'	
 		}
 		else {		// factor variable
 			local covari  : word `i' of `covars'
@@ -227,10 +305,15 @@ program define ipdfloat, eclass
 			}
 		}
 	}
-	if `"`facvar'"'!=`""' & `r'==`k' {
-		local Iyvars `Iyvars' y`Ibase'
-	}	
-		
+	if `"`facvar'"'!=`""' {
+		if `r'==`k' local Iyvars `Iyvars' y`Ibase'
+	}
+	else {
+		local Jyvars `useJyvars'
+		local Iyvar = subinstr(`"y`trtvar'"', `"_J"', `"_I"', 1)
+		local Iyvars `Iyvar' `Iyvars'
+	}
+	
 	
 	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
 	if "`showmodels'"=="" local quietly quietly
@@ -238,7 +321,7 @@ program define ipdfloat, eclass
 	
 	preserve
 		qui mvmeta_make `cmdname' `depvar' `trtvar' `intvars' `covars' `adjvars' if `touse', `cmdopts' ///
-			usevars(`trtvar' `intvars') by(`study') ppfix(check) `hard' `collapse_opt' nodetails clear
+			usevars(`trtvar' `intvars') by(`study') ppfix(check) `hard' `collapse_opt' nodetails keepmat clear
 
 		local smiss = 0
 		foreach s of varlist S_* {
@@ -257,6 +340,7 @@ program define ipdfloat, eclass
 		local chi2_int = r(chi2)
 		local df_int = r(df)
 		local p_int = r(p)
+		local rownames_eb : rownames e(b)
 
 		tempname GammaHat VarGammaHat SigmaGamma Chol
 		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
@@ -278,41 +362,55 @@ program define ipdfloat, eclass
 			matrix define `Chol' = J(`k1', `k1', 0)
 		}
 		
-		local rownames_eb : rownames e(b)
-		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''
-		matrix colnames `GammaHat' = `Jyvars'
-		matrix coleq `GammaHat' = :
-		matrix coleq `VarGammaHat' = :
-		matrix roweq `VarGammaHat' = :
-
 		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 
 			// From the IPD, we have formed a dataset of "reference subgroup" + "contrasts"
 			// However, for the saved data, we need *subgroups* rather than contrasts
 			// Therefore, form non-reference subgroups "manually" using available y* and S* variables
-			tokenize `intvars'
-
-			rename y`trtvar' _y_ES`ref'
-			qui gen double _y_seES`ref' = sqrt(S`trtvar'`trtvar')
-			
-			local i = 0
-			foreach j of local sglist {
+						
+			// NEW DF 23rd March 2022
+			// Need to form linear combinations based on Z
+			local i1 = 0
+			local i2 = 0
+			foreach j of local sglist {				
+				local ++i1
+				local comma
+				if `i1' > 1 local comma ,
+				qui gen double _y_ES`j' = .
+				qui gen double _y_seES`j' = .
+				local newyvars  `"`newyvars' `comma' "_y_ES`j'""'
+				local newsevars `"`newsevars' `comma' "_y_seES`j'""'
+				
 				if `j'!=`ref' {
-					local ++i					
-					
-					qui gen double _y_ES`j' = _y_ES`ref' + y``i''
-					qui gen double _y_seES`j' = sqrt(S`trtvar'`trtvar' + S``i''``i'' + 2*S`trtvar'``i'')
-					
-					rename y``i'' _yInt_ES`j'
-					qui gen double _yInt_seES`j' = sqrt(S``i''``i'')					
+					local ++i2
+					local comma
+					if `i2' > 1 local comma ,
+					qui gen double _yInt_ES`j' = .
+					qui gen double _yInt_seES`j' = .
+					local newyintvars  `"`newyintvars' `comma' "_yInt_ES`j'""'
+					local newseintvars `"`newseintvars' `comma' "_yInt_seES`j'""'
 				}
 			}
+			
+			mata: Z1 = J(`k', 1, 1), st_matrix("`Z'")
+			mata: st_view(y=., ., "y`trtvar' `useJyvars'")
+			mata: st_store(., (`newyvars'), y*Z1')
+			mata: Z2 = st_matrix("`Z'")[|2,1\.,.|]
+			mata: st_view(y=., ., "`useJyvars'")
+			mata: st_store(., (`newyintvars'), y*Z2')
+			forvalues s = 1 / `=_N' {
+				mata: S = st_matrix("S`s'")[1..`k', 1..`k']
+				mata: st_store(`s', (`newsevars'), sqrt(diagonal(Z1*S*Z1'))')
+				mata: S = st_matrix("S`s'")[2..`k', 2..`k']
+				mata: st_store(`s', (`newseintvars'), sqrt(diagonal(Z2*S*Z2'))')
+			}
+
 			local extra _y_ES* _y_seES*
 			local extra_reshape _y_ES _y_seES
 			
 			keep `study' _yInt_ES* _yInt_seES* `extra'
-			qui reshape long _yInt_ES _yInt_seES `extra_reshape', i(`study') j(`facvar')
-			
+			qui reshape long _yInt_ES _yInt_seES `extra_reshape', i(`study') j(`sgvar')
+
 			tempfile main_effects
 			qui save `main_effects'
 		}
@@ -347,7 +445,7 @@ program define ipdfloat, eclass
 	}
 
 	local eqlist
-	if `"`facvar'"'==`""' | `"`sepgroups'"'!=`""' {			// non-factor (i.e. continuous); or factor without by-subgroup covariance structure
+	if `"`facvar'`asfactor'"'==`""' | `"`sepgroups'"'!=`""' {		// non-factor (i.e. continuous); or factor without by-subgroup covariance structure
 		// remove `intvars' from `command':
 		local command_new `cmdname' `depvar2' `trtvar' `covars' `adjvars'
 		local usevars `trtvar'
@@ -469,13 +567,11 @@ program define ipdfloat, eclass
 	}
 		
 
-	*** Assemble matrices
-	if "`facvar'"!="" {
-		tempname ones Z A BetaHat VarBetaHat
+	*** Assemble matrices	
+	if `"`facvar'`asfactor'"'!=`""' {
+		
+		tempname ones BetaHat A VarBetaHat
 		matrix define `ones' = J(`k', 1, 1)
-		matrix define `Z' = J(`k', `k1', 0)
-		matrix define `Z'[2, 1] = I(`k1')
-
 		matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat''
 		matrix define `A' = `ones'*`Grad' + `Z'
 		matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
@@ -489,6 +585,15 @@ program define ipdfloat, eclass
 		matrix coleq `BetaHat' = :
 		matname `BetaHat'    `Iyvars', columns(.) explicit
 		matname `VarBetaHat' `Iyvars', explicit
+		
+		matrix define `GammaHat' = `GammaHat'*`Z'[2..`k', 1..`k1']'
+		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''
+		matrix colnames `GammaHat' = `Jyvars'
+		matrix coleq `GammaHat' = :
+
+		matrix define `VarGammaHat' = `Z'[2..`k', 1..`k1']*`VarGammaHat'*`Z'[2..`k', 1..`k1']'
+		matrix coleq `VarGammaHat' = :
+		matrix roweq `VarGammaHat' = :
 	}
 	
 	// continuous
@@ -539,15 +644,15 @@ program define ipdfloat, eclass
 		// re-instate original variable labels and value labels
 		if `"`sglabfile'"'!=`""' {
 			qui do `sglabfile'
-			label values `facvar' `sglab'
+			label values `sgvar' `sglab'
 		}
-		// label variable `facvar' `"`sgvarlab'"'
+		// label variable `sgvar' `"`sgvarlab'"'
 		// label variable `study' `"`studylab'"'
 		label variable `study' `"`sgvarlab'"'		// swap over, so they display correctly after -metan-
-		label variable `facvar' `"`studylab'"'
-		
-		SavingClear `GammaTable' `BetaTable', saving(`saving') ///
-			study(`study') subgroup(`facvar') augvariance(`augvariance')
+		label variable `sgvar' `"`studylab'"'
+
+		SavingClear `study' `sgvar', saving(`saving') matnames(`GammaTable' `BetaTable') ///
+			augvariance(`augvariance') `asfactor'
 		
 		if `"`clear'"'!=`""' {
 			restore, not
@@ -556,7 +661,7 @@ program define ipdfloat, eclass
 
 	
 	*** Finally, present the results
-	if "`facvar'"!="" {
+	if `"`facvar'`asfactor'"'!=`""' {
 
 		ereturn post `BetaHat' `VarBetaHat', depname(Subgroup)
 
@@ -606,7 +711,7 @@ end
 program define ProcessTerms, sclass
 
 	syntax anything [if] [in], [TRTVAR(varname numeric) INTVARs(varlist numeric) ///
-		check cmdname(string) /* undocumented; for debugging */ * /* -mvmeta- options; ignore here*/ ]
+		check cmdname(string) /* undocumented; for debugging */ ]
 	
 	marksample touse
 	
@@ -714,8 +819,8 @@ program define ProcessTerms, sclass
 			tab `intvars' if `touse'
 		}
 		local k = r(r)		// can overwrite previously-defined local k
-		if `k'>10 {
-			nois disp as err `"Too many factor levels in variable {bf:`intvars'} (max of 10)"'
+		if `k'>20 {
+			nois disp as err `"Too many factor levels in variable {bf:`intvars'} (max of 20)"'
 			exit 198
 		}
 				
@@ -766,20 +871,6 @@ program define ProcessTerms, sclass
 				nois disp `"{error}Reference value will be re-set to `r(mean)'"'
 				local ref = r(mean)
 			}
-		}
-		
-		// options not allowed with continuous interactions
-		if `"`saving'"'!=`""' {
-			nois disp as err "Cannot use option {bf:saving()} with continuous interactions"
-			exit 198
-		}
-		if `"`clear'"'!=`""' {
-			nois disp as err "Cannot use option {bf:clear} with continuous interactions"
-			exit 198
-		}	
-		if `"`sepgroups'"'!=`""' {
-			nois disp as err "Cannot use option {bf:sepgroups} with continuous interactions"
-			exit 198
 		}
 	}
 	local k1 = `k' - 1
@@ -950,7 +1041,6 @@ program define ProcessTerms, sclass
 	
 	* Fit original command and new command, and compare statistics to check they are the same model
 	if `"`check'"'==`""' exit
-	c_local checkexit checkexit
 
 	disp `"trtvar: `trtvar'"'
 	disp `"(use)intvars: `useintvars'"'
@@ -1265,10 +1355,13 @@ end
 
 program define SavingClear
 
-	syntax anything, study(varname) subgroup(varname) ///
-		[ SAVING(string asis) AUGVARiance(real 1e5) ] 
+	syntax varlist(min=2 max=2 default=none), matnames(namelist min=2 max=2) ///
+		[ SAVING(string asis) asfactor AUGVARiance(real 1e5) ]
+
+	tokenize `varlist'
+	args study subgroup
 	
-	tokenize `anything'
+	tokenize `matnames'
 	args GammaTable BetaTable
 	
 	// identify "abbreviated" form of `subgroup' used by -xi-
@@ -1282,33 +1375,41 @@ program define SavingClear
 	local k1 : word count `Jyvars'
 	assert `k1' == `k' - 1
 
-	local pre = 3		// length of prefix; here hard-coded as y_I or y_J
-	local i = 1
-	foreach name in `Iyvars' `Jyvars' {
-		local len = length(`"`name'"')
-		local j = 1
-		local el = substr(`"`name'"', -`j', `j')
-		cap confirm integer number `el'
-		while !_rc {
-			local el0 : copy local el
-			local ++j
+	if `"`asfactor'"'!=`""' {	// DF 20th Mar 2022: special case
+		qui numlist `"0/`k1'"'
+		local sglist `"`r(numlist)'"'
+		local ref = 0
+		local r = 1
+	}
+	else {
+		local pre = 3		// length of prefix; here hard-coded as y_I or y_J
+		local i = 1
+		foreach name in `Iyvars' `Jyvars' {
+			local len = length(`"`name'"')
+			local j = 1
 			local el = substr(`"`name'"', -`j', `j')
 			cap confirm integer number `el'
+			while !_rc {
+				local el0 : copy local el
+				local ++j
+				local el = substr(`"`name'"', -`j', `j')
+				cap confirm integer number `el'
+			}
+			local n1 = `pre' + 1
+			local n2 = `len' - `pre' - `j'
+			local sgab = substr(`"`name'"', `n1', `n2')
+			cap assert `"`sgab'"'==substr(`"`subgroup'"', 1, `n2')
+			if _rc {
+				nois disp as err `"Something has gone wrong involving -xi-"'
+				exit 198
+			}
+			if `i' <= `k' local sglist `sglist' `el0'
+			else local sgnoref `sgnoref' `el0'
+			local ++i
 		}
-		local n1 = `pre' + 1
-		local n2 = `len' - `pre' - `j'
-		local sgab = substr(`"`name'"', `n1', `n2')
-		cap assert `"`sgab'"'==substr(`"`subgroup'"', 1, `n2')
-		if _rc {
-			nois disp as err `"Something has gone wrong involving -xi-"'
-			exit 198
-		}
-		if `i' <= `k' local sglist `sglist' `el0'
-		else local sgnoref `sgnoref' `el0'
-		local ++i
+		local ref : list sglist - sgnoref
+		local r : list posof `"`ref'"' in sglist
 	}
-	local ref : list sglist - sgnoref
-	local r : list posof `"`ref'"' in sglist	
 	
 	// insert missing reference row into `GammaTable' so that its elements match with those of `BetaTable'
 	if `r'==1 {
@@ -1430,7 +1531,7 @@ program define ExitErr
 	disp as err  "Failed to identify interaction variables"
 	disp as err `"{it:command} should contain at least one term of the form {bf:i.}{it:trtvar}{bf:*}[{bf:i.}]{it:intvar}"'
 	
-	if `"`varlist'"'!=`""" {'
+	if `"`varlist'"'!=`""' {
 		qui drop `varlist'
 		char define _dta[__xi__Vars__Prefix__] `OldVarsPrefix'
 		char define _dta[__xi__Vars__To__Drop__] `OldVarsToDrop'	
