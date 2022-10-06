@@ -1,7 +1,7 @@
 <a href ="https://www.ctu.mrc.ac.uk/"><img src="MRCCTU_at_UCL_Logo.png" width="50%" /></a>
 
 # ipdfloat
- v0.5
+ v0.6.1
  
 # A Stata package to estimate within-trial interactions and covariate value-specific treatment effects using a two-stage IPD approach
 
